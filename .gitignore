@@ -1,0 +1,15 @@
+﻿# PlatformIO
+.pio/
+.vscode/
+*.o
+*.a
+*.so
+
+# Build
+build/
+*.bin
+*.elf
+
+# OS
+.DS_Store
+Thumbs.db
