@@ -712,18 +712,90 @@ void handleJsonCommand(const String& jsonStr) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OLED DISPLAY
+// OLED DISPLAY - Professional Layout
+// Yellow zone: rows 0-15 (header/status)
+// Blue zone: rows 16-63 (main content)
 // ═══════════════════════════════════════════════════════════════
+#define YELLOW_ZONE_HEIGHT 16
+#define BLUE_ZONE_START 16
+
+// Animation frame counter
+unsigned long displayFrame = 0;
+
+void drawCenteredText(const char* text, int y, int textSize = 1) {
+  display.setTextSize(textSize);
+  int16_t x1, y1;
+  uint16_t w, h;
+  display.getTextBounds(text, 0, 0, &x1, &y1, &w, &h);
+  display.setCursor((SCREEN_WIDTH - w) / 2, y);
+  display.print(text);
+}
+
+void drawProgressBar(int x, int y, int width, int height, int percent) {
+  display.drawRect(x, y, width, height, SSD1306_WHITE);
+  int fillWidth = (width - 2) * percent / 100;
+  if (fillWidth > 0) {
+    display.fillRect(x + 1, y + 1, fillWidth, height - 2, SSD1306_WHITE);
+  }
+}
+
+void drawSignalBars(int x, int y, int rssi) {
+  // Convert RSSI to 0-4 bars
+  int bars = 0;
+  if (rssi > -50) bars = 4;
+  else if (rssi > -60) bars = 3;
+  else if (rssi > -70) bars = 2;
+  else if (rssi > -80) bars = 1;
+
+  for (int i = 0; i < 4; i++) {
+    int barHeight = 3 + (i * 2);
+    int barY = y + (8 - barHeight);
+    if (i < bars) {
+      display.fillRect(x + (i * 4), barY, 3, barHeight, SSD1306_WHITE);
+    } else {
+      display.drawRect(x + (i * 4), barY, 3, barHeight, SSD1306_WHITE);
+    }
+  }
+}
+
+void drawDmxMeter(int x, int y, int width) {
+  // Mini DMX activity meter showing first 16 channels
+  for (int i = 0; i < 16; i++) {
+    int barHeight = map(dmxData[i + 1], 0, 255, 0, 8);
+    int barX = x + (i * (width / 16));
+    if (barHeight > 0) {
+      display.fillRect(barX, y + 8 - barHeight, 2, barHeight, SSD1306_WHITE);
+    }
+  }
+}
+
 void initOLED() {
   Wire.begin(OLED_SDA, OLED_SCL);
   if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     oledPresent = true;
     display.clearDisplay();
-    display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println("AETHER HYBRID");
-    display.println("v1.0");
+
+    // Boot animation
+    display.setTextSize(2);
+    drawCenteredText("AETHER", 4, 2);
+    display.display();
+    delay(500);
+
+    display.setTextSize(1);
+    drawCenteredText("PULSE", 24, 1);
+    display.display();
+    delay(300);
+
+    // Loading bar
+    for (int i = 0; i <= 100; i += 5) {
+      drawProgressBar(14, 40, 100, 8, i);
+      display.display();
+      delay(30);
+    }
+
+    display.clearDisplay();
+    drawCenteredText("INITIALIZING...", 28, 1);
     display.display();
   }
 }
@@ -731,43 +803,168 @@ void initOLED() {
 void updateOLED() {
   if (!oledPresent) return;
 
+  displayFrame++;
   display.clearDisplay();
-  display.setCursor(0, 0);
+
+  // ════════════════════════════════════════════════════════════
+  // YELLOW ZONE (0-15): Header with node name and status icons
+  // ════════════════════════════════════════════════════════════
   display.setTextSize(1);
 
-  // Mode indicator
-  display.print("AETHER ");
-  display.println(operationMode == MODE_WIRED ? "[WIRED]" : "[WIFI]");
-  display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  // Node name (left aligned, truncated if needed)
+  display.setCursor(0, 0);
+  String displayName = nodeName;
+  if (displayName.length() > 12) {
+    displayName = displayName.substring(0, 11) + ".";
+  }
+  display.print(displayName);
 
-  display.setCursor(0, 14);
-
+  // Status icons (right aligned)
   if (operationMode == MODE_WIRELESS) {
     if (WiFi.status() == WL_CONNECTED) {
-      display.printf("WiFi: %d dBm\n", WiFi.RSSI());
+      drawSignalBars(100, 0, WiFi.RSSI());
     } else {
-      display.println("WiFi: DISCONNECTED");
+      // WiFi disconnected - X icon
+      display.drawLine(104, 2, 112, 10, SSD1306_WHITE);
+      display.drawLine(112, 2, 104, 10, SSD1306_WHITE);
     }
-    display.printf("Universe: %d\n", currentUniverse);
   } else {
-    display.println("Pi UART connected");
-    display.printf("Cmds: %lu\n", commandsReceived);
+    // Wired mode - cable icon
+    display.fillRect(100, 4, 12, 4, SSD1306_WHITE);
+    display.fillRect(114, 3, 6, 6, SSD1306_WHITE);
   }
 
-  // Active channels
-  int active = 0;
-  for (int i = 1; i <= 512; i++) {
-    if (dmxData[i] > 0) active++;
-  }
-  display.printf("Active: %d ch\n", active);
-
-  // Chase status
-  if (isPlayingChase && currentChaseIndex >= 0) {
-    display.printf("Chase: %s\n", chases[currentChaseIndex].name);
+  // DMX activity indicator (blinking dot when active)
+  if (dmxFramesSent > 0 && (displayFrame % 2 == 0)) {
+    display.fillCircle(122, 5, 3, SSD1306_WHITE);
+  } else {
+    display.drawCircle(122, 5, 3, SSD1306_WHITE);
   }
 
-  // First 3 channels
-  display.printf("1-3: %d %d %d", dmxData[1], dmxData[2], dmxData[3]);
+  // Separator line
+  display.drawLine(0, 14, 128, 14, SSD1306_WHITE);
+
+  // ════════════════════════════════════════════════════════════
+  // BLUE ZONE (16-63): Main content based on state
+  // ════════════════════════════════════════════════════════════
+
+  if (!isPaired) {
+    // ──────────────────────────────────────────
+    // NOT CONFIGURED STATE
+    // ──────────────────────────────────────────
+    display.setTextSize(1);
+    drawCenteredText("AWAITING CONFIG", BLUE_ZONE_START + 4, 1);
+
+    // Connection status
+    display.setCursor(0, BLUE_ZONE_START + 18);
+    if (operationMode == MODE_WIRELESS) {
+      if (WiFi.status() == WL_CONNECTED) {
+        display.print("WiFi: ");
+        display.println(WiFi.SSID().substring(0, 12));
+        display.print("IP: ");
+        display.println(WiFi.localIP().toString());
+      } else {
+        display.println("WiFi: Connecting...");
+        // Animated dots
+        for (int i = 0; i < (displayFrame % 4); i++) {
+          display.print(".");
+        }
+      }
+    } else {
+      display.println("Mode: WIRED");
+      display.println("Awaiting Pi data...");
+    }
+
+    // Pulsing border animation
+    if (displayFrame % 4 < 2) {
+      display.drawRect(0, BLUE_ZONE_START, 128, 48, SSD1306_WHITE);
+    }
+
+  } else if (isPlayingChase && currentChaseIndex >= 0) {
+    // ──────────────────────────────────────────
+    // CHASE PLAYING STATE
+    // ──────────────────────────────────────────
+    display.setTextSize(1);
+    display.setCursor(0, BLUE_ZONE_START + 2);
+    display.print("CHASE");
+
+    // Chase name (larger)
+    display.setTextSize(1);
+    display.setCursor(0, BLUE_ZONE_START + 14);
+    display.print(chases[currentChaseIndex].name);
+
+    // Step indicator
+    display.setCursor(0, BLUE_ZONE_START + 26);
+    display.printf("Step %d/%d", currentChaseStep + 1, chases[currentChaseIndex].stepCount);
+
+    // BPM
+    display.setCursor(80, BLUE_ZONE_START + 26);
+    display.printf("%dBPM", chases[currentChaseIndex].bpm);
+
+    // Step progress bar
+    int stepProgress = (currentChaseStep * 100) / max(1, chases[currentChaseIndex].stepCount - 1);
+    drawProgressBar(0, BLUE_ZONE_START + 38, 128, 6, stepProgress);
+
+  } else {
+    // ──────────────────────────────────────────
+    // NORMAL OPERATING STATE
+    // ──────────────────────────────────────────
+
+    // Universe display (prominent)
+    display.setTextSize(2);
+    display.setCursor(0, BLUE_ZONE_START + 2);
+    display.print("U");
+    display.print(currentUniverse);
+
+    // Mode badge
+    display.setTextSize(1);
+    display.setCursor(50, BLUE_ZONE_START + 2);
+    display.print(operationMode == MODE_WIRED ? "WIRED" : "sACN");
+
+    // Channel range
+    display.setCursor(50, BLUE_ZONE_START + 12);
+    display.printf("Ch %d-%d", channelStart, channelEnd);
+
+    // Active channel count
+    int activeChannels = 0;
+    int totalLevel = 0;
+    for (int i = 1; i <= 512; i++) {
+      if (dmxData[i] > 0) {
+        activeChannels++;
+        totalLevel += dmxData[i];
+      }
+    }
+
+    display.setCursor(0, BLUE_ZONE_START + 24);
+    display.printf("Active: %d ch", activeChannels);
+
+    // Average level (if any active)
+    if (activeChannels > 0) {
+      int avgLevel = (totalLevel / activeChannels) * 100 / 255;
+      display.setCursor(80, BLUE_ZONE_START + 24);
+      display.printf("@%d%%", avgLevel);
+    }
+
+    // DMX activity meter
+    display.setCursor(0, BLUE_ZONE_START + 34);
+    display.print("DMX:");
+    drawDmxMeter(28, BLUE_ZONE_START + 34, 96);
+
+    // Connection quality (wireless only)
+    if (operationMode == MODE_WIRELESS && WiFi.status() == WL_CONNECTED) {
+      display.setCursor(0, BLUE_ZONE_START + 44);
+      display.printf("RSSI:%ddBm", WiFi.RSSI());
+
+      // Packets counter
+      display.setCursor(70, BLUE_ZONE_START + 44);
+      display.printf("P:%lu", sacnPacketsReceived % 100000);
+    } else if (operationMode == MODE_WIRED) {
+      display.setCursor(0, BLUE_ZONE_START + 44);
+      display.printf("Cmds:%lu", commandsReceived);
+      display.setCursor(70, BLUE_ZONE_START + 44);
+      display.printf("F:%lu", dmxFramesSent % 100000);
+    }
+  }
 
   display.display();
 }
