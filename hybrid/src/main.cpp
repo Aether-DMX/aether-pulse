@@ -680,20 +680,26 @@ void handleJsonCommand(const String& jsonStr) {
   }
   // Configuration
   else if (strcmp(cmd, "config") == 0) {
+    Serial.println(">>> CONFIG COMMAND RECEIVED <<<");
     if (doc["name"].is<const char*>()) {
       nodeName = doc["name"].as<String>();
+      Serial.printf("  Name: %s\n", nodeName.c_str());
     }
     if (doc["universe"].is<int>()) {
       changeUniverse(doc["universe"]);
+      Serial.printf("  Universe: %d\n", currentUniverse);
     }
     if (doc["channel_start"].is<int>()) {
       channelStart = doc["channel_start"];
+      Serial.printf("  Ch Start: %d\n", channelStart);
     }
     if (doc["channel_end"].is<int>()) {
       channelEnd = doc["channel_end"];
+      Serial.printf("  Ch End: %d\n", channelEnd);
     }
     isPaired = true;
     saveConfig();
+    Serial.println(">>> CONFIG SAVED - isPaired = true <<<");
   }
   // Identify (flash LED)
   else if (strcmp(cmd, "identify") == 0) {
@@ -1083,6 +1089,7 @@ void loop() {
       int len = configUdp.read(buffer, sizeof(buffer) - 1);
       if (len > 0) {
         buffer[len] = '\0';
+        Serial.printf("UDP Config received (%d bytes): %s\n", len, buffer);
         handleJsonCommand(String(buffer));
       }
     }
