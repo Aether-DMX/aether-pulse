@@ -1023,6 +1023,11 @@ void setup() {
       connectWiFi();
     }
     if (WiFi.status() == WL_CONNECTED) {
+      // Always start UDP listeners (may have connected in detectMode)
+      discoveryUdp.begin(DISCOVERY_PORT);
+      configUdp.begin(CONFIG_PORT);
+      Serial.printf("UDP listening: discovery=%d, config=%d\n", DISCOVERY_PORT, CONFIG_PORT);
+
       initSacn();
       sendRegistration();
     }
