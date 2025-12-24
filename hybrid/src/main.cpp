@@ -1,5 +1,5 @@
 /**
- * AETHER DMX Hybrid Node v1.0
+ * AETHER DMX Hybrid Node v1.1
  * Auto-detects wired (UART from Pi) or wireless (sACN/E1.31) mode
  *
  * Features:
@@ -321,7 +321,7 @@ void sendRegistration() {
     "{\"type\":\"register\",\"node_id\":\"%s\",\"hostname\":\"%s\","
     "\"mac\":\"%s\",\"ip\":\"%s\",\"universe\":%d,"
     "\"startChannel\":%d,\"channelCount\":%d,"
-    "\"version\":\"hybrid-1.0\",\"rssi\":%d,\"uptime\":%lu,\"paired\":%s}",
+    "\"version\":\"hybrid-1.1\",\"rssi\":%d,\"uptime\":%lu,\"paired\":%s}",
     nodeId.c_str(), nodeName.c_str(),
     WiFi.macAddress().c_str(), WiFi.localIP().toString().c_str(),
     currentUniverse, channelStart, channelEnd - channelStart + 1,
@@ -989,7 +989,7 @@ void setup() {
 
   Serial.println("\n");
   Serial.println("═══════════════════════════════════════");
-  Serial.println("  AETHER Hybrid Node v1.0");
+  Serial.println("  AETHER Hybrid Node v1.1");
   Serial.println("  Auto-detect Wired/Wireless");
   Serial.println("═══════════════════════════════════════");
 
@@ -1088,13 +1088,14 @@ void loop() {
     }
 
     // Check for UDP config packets
+    // NOTE: Buffer must be large enough for full 512-channel JSON frames (~2100 bytes max)
     int packetSize = configUdp.parsePacket();
     if (packetSize > 0) {
-      char buffer[512];
+      char buffer[2500];  // Increased from 512 to handle full 512-channel frames
       int len = configUdp.read(buffer, sizeof(buffer) - 1);
       if (len > 0) {
         buffer[len] = '\0';
-        Serial.printf("UDP Config received (%d bytes): %s\n", len, buffer);
+        Serial.printf("UDP Config received (%d bytes)\n", len);
         handleJsonCommand(String(buffer));
       }
     }
