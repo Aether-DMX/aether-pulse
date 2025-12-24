@@ -1,5 +1,5 @@
 /**
- * AETHER DMX Hybrid Node v1.2
+ * AETHER DMX Hybrid Node v1.3
  * Auto-detects wired (UART from Pi) or wireless (sACN/E1.31) mode
  *
  * Features:
@@ -156,6 +156,7 @@ unsigned long lastPiData = 0;
 void sendRegistration();
 void initSacn();
 void saveConfig();
+void clearConfig();
 void sendDMXFrame();
 void processFades();
 void processChase();
@@ -251,6 +252,27 @@ void saveConfig() {
   preferences.end();
 }
 
+void clearConfig() {
+  preferences.begin("aether", false);
+  preferences.clear();
+  preferences.end();
+
+  // Reset to defaults
+  currentUniverse = 1;
+  channelStart = 1;
+  channelEnd = 512;
+  isPaired = false;
+
+  // Reset name to default based on MAC
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char macStr[5];
+  sprintf(macStr, "%02X%02X", mac[4], mac[5]);
+  nodeName = String("AETHER-") + String(macStr);
+
+  Serial.println("✓ Config cleared - reset to defaults");
+}
+
 // ═══════════════════════════════════════════════════════════════
 // sACN MANAGEMENT (Wireless mode)
 // ═══════════════════════════════════════════════════════════════
@@ -324,7 +346,7 @@ void sendRegistration() {
     "{\"type\":\"register\",\"node_id\":\"%s\",\"hostname\":\"%s\","
     "\"mac\":\"%s\",\"ip\":\"%s\",\"universe\":%d,"
     "\"startChannel\":%d,\"channelCount\":%d,"
-    "\"version\":\"hybrid-1.2\",\"rssi\":%d,\"uptime\":%lu,\"paired\":%s}",
+    "\"version\":\"hybrid-1.3\",\"rssi\":%d,\"uptime\":%lu,\"paired\":%s}",
     nodeId.c_str(), nodeName.c_str(),
     WiFi.macAddress().c_str(), WiFi.localIP().toString().c_str(),
     currentUniverse, channelStart, channelEnd - channelStart + 1,
@@ -704,6 +726,14 @@ void handleJsonCommand(const String& jsonStr) {
     saveConfig();
     Serial.println(">>> CONFIG SAVED - isPaired = true <<<");
   }
+  // Unpair - reset to unconfigured state
+  else if (strcmp(cmd, "unpair") == 0) {
+    Serial.println(">>> UNPAIR COMMAND RECEIVED <<<");
+    clearConfig();
+    initSacn();  // Re-init sACN with default universe
+    sendRegistration();  // Re-register as unpaired
+    Serial.println("✓ Node unpaired - awaiting configuration");
+  }
   // Identify (flash LED)
   else if (strcmp(cmd, "identify") == 0) {
     for (int i = 0; i < 20; i++) {
@@ -1032,7 +1062,7 @@ void setup() {
 
   Serial.println("\n");
   Serial.println("═══════════════════════════════════════");
-  Serial.println("  AETHER Hybrid Node v1.2");
+  Serial.println("  AETHER Hybrid Node v1.3");
   Serial.println("  Auto-detect Wired/Wireless + OTA");
   Serial.println("═══════════════════════════════════════");
 
