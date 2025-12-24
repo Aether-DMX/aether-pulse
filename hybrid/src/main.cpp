@@ -1,5 +1,5 @@
 /**
- * AETHER DMX Hybrid Node v1.1
+ * AETHER DMX Hybrid Node v1.2
  * Auto-detects wired (UART from Pi) or wireless (sACN/E1.31) mode
  *
  * Features:
@@ -9,12 +9,14 @@
  * - Local scene/chase storage and playback
  * - Hold-last-look when connection lost
  * - Fade engine with smooth transitions
+ * - OTA updates (wireless mode only)
  */
 
 #include <Arduino.h>
 #include <esp_dmx.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <ArduinoOTA.h>
 #include <ESPAsyncE131.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -161,6 +163,7 @@ void startFade(int channel, uint8_t targetValue, unsigned long durationMs);
 void handleJsonCommand(const String& jsonStr);
 void initOLED();
 void updateOLED();
+void initOTA();
 
 // ═══════════════════════════════════════════════════════════════
 // MODE DETECTION
@@ -321,7 +324,7 @@ void sendRegistration() {
     "{\"type\":\"register\",\"node_id\":\"%s\",\"hostname\":\"%s\","
     "\"mac\":\"%s\",\"ip\":\"%s\",\"universe\":%d,"
     "\"startChannel\":%d,\"channelCount\":%d,"
-    "\"version\":\"hybrid-1.1\",\"rssi\":%d,\"uptime\":%lu,\"paired\":%s}",
+    "\"version\":\"hybrid-1.2\",\"rssi\":%d,\"uptime\":%lu,\"paired\":%s}",
     nodeId.c_str(), nodeName.c_str(),
     WiFi.macAddress().c_str(), WiFi.localIP().toString().c_str(),
     currentUniverse, channelStart, channelEnd - channelStart + 1,
@@ -976,6 +979,46 @@ void updateOLED() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// OTA UPDATE SUPPORT
+// ═══════════════════════════════════════════════════════════════
+void initOTA() {
+  // Set hostname for OTA (makes it easy to find on network)
+  ArduinoOTA.setHostname(nodeName.c_str());
+
+  // Optional: Set OTA password (uncomment to enable)
+  // ArduinoOTA.setPassword("aether");
+
+  ArduinoOTA.onStart([]() {
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "firmware" : "filesystem";
+    Serial.println("🔄 OTA Update starting: " + type);
+    // Stop DMX output during update to prevent glitches
+    isPlayingChase = false;
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\n✅ OTA Update complete! Rebooting...");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+    // Blink LED during update
+    digitalWrite(LED_PIN, (progress / 1000) % 2);
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("❌ OTA Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+  });
+
+  ArduinoOTA.begin();
+  Serial.printf("✓ OTA enabled: %s.local\n", nodeName.c_str());
+}
+
+// ═══════════════════════════════════════════════════════════════
 // SETUP
 // ═══════════════════════════════════════════════════════════════
 void setup() {
@@ -989,8 +1032,8 @@ void setup() {
 
   Serial.println("\n");
   Serial.println("═══════════════════════════════════════");
-  Serial.println("  AETHER Hybrid Node v1.1");
-  Serial.println("  Auto-detect Wired/Wireless");
+  Serial.println("  AETHER Hybrid Node v1.2");
+  Serial.println("  Auto-detect Wired/Wireless + OTA");
   Serial.println("═══════════════════════════════════════");
 
   // Generate node ID
@@ -1029,6 +1072,7 @@ void setup() {
       Serial.printf("UDP listening: discovery=%d, config=%d\n", DISCOVERY_PORT, CONFIG_PORT);
 
       initSacn();
+      initOTA();  // Enable OTA updates in wireless mode
       sendRegistration();
     }
   }
@@ -1050,6 +1094,11 @@ void loop() {
   unsigned long now = millis();
   static String piBuffer = "";
   static String serialBuffer = "";
+
+  // Handle OTA updates (wireless mode only)
+  if (operationMode == MODE_WIRELESS) {
+    ArduinoOTA.handle();
+  }
 
   // Process fades
   processFades();
