@@ -1,15 +1,18 @@
 /**
- * AETHER DMX Hybrid Node v1.3
- * Auto-detects wired (UART from Pi) or wireless (sACN/E1.31) mode
+ * AETHER Pulse DMX Node
+ * Supports multiple transport modes via build flags:
+ *   - ENABLE_SACN: sACN/E1.31 + UDP JSON (hybrid mode)
+ *   - ENABLE_ESPNOW: ESP-NOW broadcast (low-latency mode)
  *
  * Features:
  * - Auto-detect: checks for Pi UART connection on boot
  * - Wired mode: receives JSON commands from Pi via UART
- * - Wireless mode: receives sACN/E1.31 + UDP commands
+ * - Wireless mode: receives sACN/E1.31 + UDP commands (or ESP-NOW)
  * - Local scene/chase storage and playback
  * - Hold-last-look when connection lost
  * - Fade engine with smooth transitions
  * - OTA updates (wireless mode only)
+ * - Firmware identity + OTA channel gating
  */
 
 #include <Arduino.h>
@@ -17,7 +20,22 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include "firmware_identity.h"
+
+// Conditional includes based on transport mode
+#ifdef ENABLE_SACN
 #include <ESPAsyncE131.h>
+#endif
+
+// ESP-NOW node mode (receive ESP-NOW broadcasts)
+#ifdef ENABLE_ESPNOW
+#include "transport.h"  // For Transport namespace
+#endif
+
+// ESP-NOW Gateway mode (rebroadcast sACN/UART to ESP-NOW nodes)
+#ifdef ENABLE_ESPNOW_GATEWAY
+#include "transport.h"  // For EspNowGateway namespace
+#endif
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
@@ -27,12 +45,27 @@
 // ═══════════════════════════════════════════════════════════════
 // PIN DEFINITIONS
 // ═══════════════════════════════════════════════════════════════
+
+#ifdef ENABLE_ESPNOW_GATEWAY
+// Gateway mode: Pi UART on GPIO16/17, DMX on GPIO18/19
+// This allows both Pi comms AND local DMX output simultaneously
+#define DMX_TX_PIN 19
+#define DMX_RX_PIN 18
+#define DMX_ENABLE_PIN 4
+#define DMX_PORT 2        // Use UART2 for DMX
+
+#define PI_RX_PIN 16      // Pi TX -> ESP RX (UART1)
+#define PI_TX_PIN 17      // ESP TX -> Pi RX (for future RDM)
+#else
+// Node mode: DMX on GPIO16/17 (no Pi connection)
 #define DMX_TX_PIN 17
 #define DMX_RX_PIN 16
 #define DMX_ENABLE_PIN 4
 #define DMX_PORT 1
 
 #define PI_RX_PIN 16      // Same as DMX_RX - reused in wired mode
+#endif
+
 #define LED_PIN 2
 #define OLED_SDA 21
 #define OLED_SCL 22
@@ -79,7 +112,9 @@ OperationMode operationMode = MODE_UNKNOWN;
 Preferences preferences;
 WiFiUDP discoveryUdp;
 WiFiUDP configUdp;
+#ifdef ENABLE_SACN
 ESPAsyncE131* e131 = nullptr;
+#endif
 HardwareSerial DmxSerial(2);   // UART2 for DMX output
 HardwareSerial PiSerial(1);    // UART1 for Pi commands (wired mode)
 
@@ -101,6 +136,7 @@ struct Fade {
   unsigned long duration;
   bool active;
 } fades[DMX_PACKET_SIZE];
+bool fadeActive = false;  // True if any channel is fading
 
 // Scene storage (up to 10 scenes)
 #define MAX_SCENES 10
@@ -154,7 +190,9 @@ unsigned long lastPiData = 0;
 
 // Forward declarations
 void sendRegistration();
+#ifdef ENABLE_SACN
 void initSacn();
+#endif
 void saveConfig();
 void clearConfig();
 void sendDMXFrame();
@@ -174,6 +212,46 @@ OperationMode detectMode() {
   // Send a probe and wait for response, or check for existing data
 
   Serial.println("Detecting operation mode...");
+
+#ifdef ENABLE_ESPNOW_GATEWAY
+  // Gateway firmware ALWAYS runs in wired mode (receives from Pi UART)
+  // It doesn't support sACN/wireless input - only ESP-NOW broadcast output
+  Serial.println("  -> Gateway firmware: WIRED mode (Pi UART input)");
+  return MODE_WIRED;
+
+#elif defined(ENABLE_ESPNOW)
+  // ESP-NOW node firmware
+  // If not paired: connect to WiFi for discovery/pairing (like hybrid nodes)
+  // If paired: use ESP-NOW broadcast mode (no WiFi AP connection)
+
+  if (!isPaired) {
+    Serial.println("  -> ESP-NOW node: NOT PAIRED - entering WiFi pairing mode");
+    // Connect to WiFi for pairing via the normal discovery flow
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, strlen(WIFI_PASSWORD) > 0 ? WIFI_PASSWORD : nullptr);
+
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+      delay(500);
+      Serial.print(".");
+      digitalWrite(LED_PIN, !digitalRead(LED_PIN));  // Blink during connection
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("\n  -> WiFi connected for pairing: %s\n", WiFi.localIP().toString().c_str());
+      return MODE_WIRELESS;  // Use WiFi mode for pairing
+    } else {
+      Serial.println("\n  -> WiFi failed, waiting for pairing...");
+      // Stay in wireless mode but keep trying
+      return MODE_WIRELESS;
+    }
+  } else {
+    Serial.println("  -> ESP-NOW node: PAIRED - using ESP-NOW receiver mode");
+    return MODE_WIRELESS;  // Will use ESP-NOW instead of WiFi
+  }
+
+#else
+  // Hybrid (sACN) node firmware: detect based on Pi connection or WiFi availability
 
   // Initialize Pi serial temporarily to check for data
   PiSerial.begin(115200, SERIAL_8N1, PI_RX_PIN, -1);
@@ -215,6 +293,7 @@ OperationMode detectMode() {
 
   Serial.printf("  -> Using stored mode: %s\n", storedMode == MODE_WIRED ? "WIRED" : "WIRELESS");
   return (OperationMode)storedMode;
+#endif
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -274,8 +353,9 @@ void clearConfig() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// sACN MANAGEMENT (Wireless mode)
+// sACN MANAGEMENT (Wireless mode - only when ENABLE_SACN)
 // ═══════════════════════════════════════════════════════════════
+#ifdef ENABLE_SACN
 void initSacn() {
   if (e131 != nullptr) {
     delete e131;
@@ -290,6 +370,7 @@ void initSacn() {
     Serial.println("sACN init failed!");
   }
 }
+#endif
 
 void changeUniverse(int newUniverse) {
   if (newUniverse < 1 || newUniverse > 63999) return;
@@ -298,9 +379,11 @@ void changeUniverse(int newUniverse) {
   Serial.printf("Universe: %d -> %d\n", currentUniverse, newUniverse);
   currentUniverse = newUniverse;
 
+#ifdef ENABLE_SACN
   if (operationMode == MODE_WIRELESS) {
     initSacn();
   }
+#endif
 
   saveConfig();
   sendRegistration();
@@ -434,10 +517,12 @@ void startFade(int channel, uint8_t targetValue, unsigned long durationMs) {
 
 void processFades() {
   unsigned long now = millis();
+  bool anyActive = false;
 
   for (int i = 1; i <= 512; i++) {
     if (!fades[i].active) continue;
 
+    anyActive = true;
     unsigned long elapsed = now - fades[i].startTime;
 
     if (elapsed >= fades[i].duration) {
@@ -446,10 +531,11 @@ void processFades() {
     } else {
       float progress = (float)elapsed / fades[i].duration;
       float eased = 0.5f - 0.5f * cosf(progress * PI);
-      int range = fades[i].target - fades[i].start;
-      dmxData[i] = fades[i].start + (uint8_t)(range * eased);
+      int range = (int)fades[i].target - (int)fades[i].start;
+      dmxData[i] = (uint8_t)(fades[i].start + (int)(range * eased));
     }
   }
+  fadeActive = anyActive;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -730,9 +816,18 @@ void handleJsonCommand(const String& jsonStr) {
   else if (strcmp(cmd, "unpair") == 0) {
     Serial.println(">>> UNPAIR COMMAND RECEIVED <<<");
     clearConfig();
+#ifdef ENABLE_ESPNOW
+    // ESP-NOW nodes need to reboot to switch back to WiFi pairing mode
+    Serial.println("✓ Node unpaired - rebooting to WiFi pairing mode...");
+    delay(1000);
+    ESP.restart();
+#else
+#ifdef ENABLE_SACN
     initSacn();  // Re-init sACN with default universe
+#endif
     sendRegistration();  // Re-register as unpaired
     Serial.println("✓ Node unpaired - awaiting configuration");
+#endif
   }
   // Identify (flash LED)
   else if (strcmp(cmd, "identify") == 0) {
@@ -810,8 +905,20 @@ void drawDmxMeter(int x, int y, int width) {
 
 void initOLED() {
   Wire.begin(OLED_SDA, OLED_SCL);
+
+  // Try common OLED addresses
   if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     oledPresent = true;
+    Serial.println("OLED: Found at 0x3C");
+  } else if (display.begin(SSD1306_SWITCHCAPVCC, 0x3D)) {
+    oledPresent = true;
+    Serial.println("OLED: Found at 0x3D");
+  } else {
+    Serial.println("OLED: Not detected (checked 0x3C, 0x3D)");
+    return;
+  }
+
+  if (oledPresent) {
     display.clearDisplay();
     display.setTextColor(SSD1306_WHITE);
 
@@ -1060,19 +1167,15 @@ void setup() {
   memset(scenes, 0, sizeof(scenes));
   memset(chases, 0, sizeof(chases));
 
-  Serial.println("\n");
-  Serial.println("═══════════════════════════════════════");
-  Serial.println("  AETHER Hybrid Node v1.3");
-  Serial.println("  Auto-detect Wired/Wireless + OTA");
-  Serial.println("═══════════════════════════════════════");
-
-  // Generate node ID
+  // Generate node ID first (needed for boot banner)
   uint8_t mac[6];
   WiFi.macAddress(mac);
   char macStr[13];
   sprintf(macStr, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
   nodeId = String("node-") + String(macStr).substring(8);
-  Serial.printf("Node ID: %s\n", nodeId.c_str());
+
+  // Print firmware identity banner
+  printFirmwareIdentity(nodeId.c_str(), currentUniverse);
 
   // LED
   pinMode(LED_PIN, OUTPUT);
@@ -1091,7 +1194,57 @@ void setup() {
   // Initialize based on mode
   if (operationMode == MODE_WIRED) {
     PiSerial.begin(115200, SERIAL_8N1, PI_RX_PIN, -1);
+
+#ifdef ENABLE_ESPNOW_GATEWAY
+    // WIRED mode with ESP-NOW gateway: init WiFi for ESP-NOW only (no connection needed)
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();  // Don't connect to any AP, just enable radio for ESP-NOW
+
+    // Initialize ESP-NOW gateway for rebroadcasting UART commands to ESP-NOW nodes
+    if (EspNowGateway::init()) {
+      Serial.println("ESP-NOW Gateway: Active (WIRED mode - will rebroadcast UART frames)");
+    } else {
+      Serial.println("ESP-NOW Gateway: Init failed!");
+    }
+#endif
+
   } else {
+#ifdef ENABLE_ESPNOW
+    if (isPaired) {
+      // ESP-NOW node (PAIRED): init transport layer for ESP-NOW reception
+      Transport::init(currentUniverse);
+      Transport::onFrame([](uint16_t universe, const uint8_t* channels, uint32_t fade_ms, uint32_t seq) {
+        // Copy received frame to DMX buffer
+        if (fade_ms > 0) {
+          // Apply fades
+          for (int i = 0; i < 512; i++) {
+            if (channels[i] != dmxData[i + 1]) {
+              startFade(i + 1, channels[i], fade_ms);
+            }
+          }
+        } else {
+          // Instant update
+          memcpy(dmxData + 1, channels, 512);
+        }
+      });
+      Serial.printf("ESP-NOW: Listening on channel %d, universe %d\n", ESPNOW_CHANNEL, currentUniverse);
+    } else {
+      // ESP-NOW node (UNPAIRED): use WiFi for discovery/pairing
+      // WiFi was already connected in detectMode(), just start UDP listeners
+      if (WiFi.status() == WL_CONNECTED) {
+        discoveryUdp.begin(DISCOVERY_PORT);
+        configUdp.begin(CONFIG_PORT);
+        Serial.printf("PAIRING MODE: UDP listening on discovery=%d, config=%d\n", DISCOVERY_PORT, CONFIG_PORT);
+        initOTA();  // Enable OTA in pairing mode too
+        sendRegistration();  // Announce to Pi
+        Serial.println(">>> Waiting for pairing via WiFi - will switch to ESP-NOW after config <<<");
+      } else {
+        Serial.println("WARNING: WiFi not connected, cannot pair. Retry on next boot.");
+      }
+    }
+
+#else
+    // sACN/Hybrid node: connect to WiFi
     if (WiFi.status() != WL_CONNECTED) {
       connectWiFi();
     }
@@ -1101,10 +1254,23 @@ void setup() {
       configUdp.begin(CONFIG_PORT);
       Serial.printf("UDP listening: discovery=%d, config=%d\n", DISCOVERY_PORT, CONFIG_PORT);
 
+#ifdef ENABLE_SACN
       initSacn();
+#endif
+
+#ifdef ENABLE_ESPNOW_GATEWAY
+      // Initialize ESP-NOW gateway for rebroadcasting to ESP-NOW nodes
+      if (EspNowGateway::init()) {
+        Serial.println("ESP-NOW Gateway: Active (will rebroadcast sACN)");
+      } else {
+        Serial.println("ESP-NOW Gateway: Init failed!");
+      }
+#endif
+
       initOTA();  // Enable OTA updates in wireless mode
       sendRegistration();
     }
+#endif
   }
 
   // Initialize DMX output
@@ -1124,11 +1290,6 @@ void loop() {
   unsigned long now = millis();
   static String piBuffer = "";
   static String serialBuffer = "";
-
-  // Handle OTA updates (wireless mode only)
-  if (operationMode == MODE_WIRELESS) {
-    ArduinoOTA.handle();
-  }
 
   // Process fades
   processFades();
@@ -1153,18 +1314,70 @@ void loop() {
       }
     }
   } else {
-    // Wireless mode: check sACN packets
+#ifdef ENABLE_ESPNOW
+    if (isPaired) {
+      // ESP-NOW node (PAIRED): poll transport for received frames
+      Transport::poll();
+    } else {
+      // ESP-NOW node (UNPAIRED): handle WiFi pairing mode
+      ArduinoOTA.handle();
+
+      // Check for UDP config packets (for pairing)
+      int packetSize = configUdp.parsePacket();
+      if (packetSize > 0) {
+        char buffer[2500];
+        int len = configUdp.read(buffer, sizeof(buffer) - 1);
+        if (len > 0) {
+          buffer[len] = '\0';
+          Serial.printf("PAIRING: UDP Config received (%d bytes)\n", len);
+          handleJsonCommand(String(buffer));
+
+          // If we just got paired, reboot to switch to ESP-NOW mode
+          if (isPaired) {
+            Serial.println("\n>>> PAIRED! Rebooting to ESP-NOW mode... <<<\n");
+            delay(1000);
+            ESP.restart();
+          }
+        }
+      }
+
+      // Heartbeat every 10 seconds
+      if (now - lastHeartbeat >= 10000) {
+        if (WiFi.status() == WL_CONNECTED) {
+          sendHeartbeat();
+        }
+        lastHeartbeat = now;
+      }
+
+      // WiFi reconnect check
+      if (now - lastWifiCheck >= 5000) {
+        if (WiFi.status() != WL_CONNECTED) {
+          Serial.println("WiFi lost, reconnecting for pairing...");
+          WiFi.begin(WIFI_SSID, strlen(WIFI_PASSWORD) > 0 ? WIFI_PASSWORD : nullptr);
+        }
+        lastWifiCheck = now;
+      }
+    }
+#else
+    // sACN/Hybrid node: handle OTA and sACN
+    ArduinoOTA.handle();
+
+#ifdef ENABLE_SACN
+    // Check sACN packets
     if (e131 != nullptr && !e131->isEmpty()) {
       e131_packet_t packet;
       e131->pull(&packet);
 
-      // Only update if NOT playing a local chase
-      if (!isPlayingChase) {
+      // Only update if NOT playing a local chase AND no fades active
+      // This prevents sACN from stomping on UDP JSON fade commands
+      if (!isPlayingChase && !fadeActive) {
         memcpy(dmxData + 1, packet.property_values + 1, 512);
       }
       sacnPacketsReceived++;
       lastSacnReceived = now;
+      // ESP-NOW broadcast now happens in the DMX send loop for consistent 40Hz timing
     }
+#endif
 
     // Check for UDP config packets
     // NOTE: Buffer must be large enough for full 512-channel JSON frames (~2100 bytes max)
@@ -1192,13 +1405,16 @@ void loop() {
       if (WiFi.status() != WL_CONNECTED) {
         Serial.println("WiFi lost, reconnecting...");
         connectWiFi();
+#ifdef ENABLE_SACN
         if (WiFi.status() == WL_CONNECTED) {
           initSacn();
           sendRegistration();
         }
+#endif
       }
       lastWifiCheck = now;
     }
+#endif  // !ENABLE_ESPNOW (sACN/Hybrid mode)
   }
 
   // USB Serial for testing (both modes)
@@ -1219,6 +1435,14 @@ void loop() {
   if (now - lastDmxSend >= 25) {
     sendDMXFrame();
     lastDmxSend = now;
+
+#ifdef ENABLE_ESPNOW_GATEWAY
+    // Broadcast current DMX frame to ESP-NOW nodes (both WIRED and WIRELESS modes)
+    // This ensures ESP-NOW nodes get synchronized updates at the same rate as local DMX
+    static uint32_t espnowSeq = 0;
+    espnowSeq++;
+    EspNowGateway::broadcastFrame(currentUniverse, dmxData + 1, 0, espnowSeq);
+#endif
   }
 
   // Update OLED every second
@@ -1231,15 +1455,27 @@ void loop() {
   // Debug output every 5 seconds
   static unsigned long lastDebug = 0;
   if (now - lastDebug >= 5000) {
-    if (operationMode == MODE_WIRELESS) {
+    if (operationMode == MODE_WIRED) {
+      Serial.printf("WIRED Cmds:%lu DMX:%lu Ch1-3:[%d,%d,%d]\n",
+        commandsReceived, dmxFramesSent,
+        dmxData[1], dmxData[2], dmxData[3]);
+    } else {
+#ifdef ENABLE_ESPNOW
+      if (isPaired) {
+        Serial.printf("ESP-NOW RX:%lu Drop:%lu DMX:%lu Ch1-3:[%d,%d,%d]\n",
+          Transport::getPacketsReceived(), Transport::getPacketsDropped(), dmxFramesSent,
+          dmxData[1], dmxData[2], dmxData[3]);
+      } else {
+        Serial.printf("PAIRING MODE: WiFi=%s IP=%s - Waiting for config...\n",
+          WiFi.status() == WL_CONNECTED ? "OK" : "DISC",
+          WiFi.localIP().toString().c_str());
+      }
+#else
       Serial.printf("U%d sACN:%lu DMX:%lu Ch1-3:[%d,%d,%d] Chase:%s\n",
         currentUniverse, sacnPacketsReceived, dmxFramesSent,
         dmxData[1], dmxData[2], dmxData[3],
         isPlayingChase ? "YES" : "no");
-    } else {
-      Serial.printf("WIRED Cmds:%lu DMX:%lu Ch1-3:[%d,%d,%d]\n",
-        commandsReceived, dmxFramesSent,
-        dmxData[1], dmxData[2], dmxData[3]);
+#endif
     }
     lastDebug = now;
   }

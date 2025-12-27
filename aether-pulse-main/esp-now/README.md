@@ -1,5 +1,25 @@
 # AETHER Pulse ESP-NOW DMX Streaming
 
+> **STATUS: PROTOTYPE / DEFERRED**
+>
+> This implementation does NOT currently build. Use `aether-pulse/hybrid/` with `env:pulse_espnow` instead.
+>
+> **Issues preventing build:**
+> - Missing `#include <Arduino.h>` in multiple source files
+> - Missing `#include <esp_wifi.h>` for `esp_wifi_set_channel()`
+> - `ARDUINO_USB_CDC_ON_BOOT=1` flag disables `Serial` on standard ESP32
+> - Macro collision: `DMX_PACKET_SIZE` conflicts with `esp_dmx` library
+>
+> **Recommended alternative:** `aether-pulse/hybrid/` provides a working ESP-NOW implementation:
+> ```bash
+> cd aether-pulse/hybrid
+> pio run -e pulse_espnow  # Builds successfully
+> ```
+>
+> *Last updated: 2025-12-27*
+
+---
+
 High-performance, low-latency DMX universe streaming over ESP-NOW for the AETHER DMX ecosystem.
 
 ## Overview
