@@ -88,6 +88,49 @@ const char* CONTROLLER_IP = "192.168.50.1";
 #define DMX_REFRESH_HZ 40
 
 // ═══════════════════════════════════════════════════════════════
+// MULTI-UNIVERSE GATEWAY SUPPORT
+// ═══════════════════════════════════════════════════════════════
+#ifdef ENABLE_ESPNOW_GATEWAY
+#define MAX_UNIVERSES 8          // Support universes 1-8
+#define UNIVERSE_KEEPALIVE_MS 500 // Broadcast unchanged universes every 500ms (2Hz)
+#define UNIVERSE_TIMEOUT_MS 30000 // Consider universe inactive after 30s no updates
+
+struct UniverseBuffer {
+  uint8_t data[512];              // DMX channel data
+  uint32_t lastUpdateTime;        // When Pi last sent data for this universe
+  uint32_t lastBroadcastTime;     // When we last broadcast this universe
+  uint32_t seq;                   // Sequence number for this universe
+  uint32_t framesReceived;        // Frames received from Pi
+  uint32_t framesBroadcast;       // Frames broadcast via ESP-NOW
+  bool dirty;                     // True if data changed since last broadcast
+  bool active;                    // True if universe has been used
+};
+
+UniverseBuffer universeBuffers[MAX_UNIVERSES];  // Index 0 = Universe 1, etc.
+
+// Helper to get universe buffer (returns nullptr if invalid)
+UniverseBuffer* getUniverseBuffer(int universe) {
+  if (universe < 1 || universe > MAX_UNIVERSES) return nullptr;
+  return &universeBuffers[universe - 1];
+}
+
+// Initialize all universe buffers
+void initUniverseBuffers() {
+  for (int i = 0; i < MAX_UNIVERSES; i++) {
+    memset(universeBuffers[i].data, 0, 512);
+    universeBuffers[i].lastUpdateTime = 0;
+    universeBuffers[i].lastBroadcastTime = 0;
+    universeBuffers[i].seq = 0;
+    universeBuffers[i].framesReceived = 0;
+    universeBuffers[i].framesBroadcast = 0;
+    universeBuffers[i].dirty = false;
+    universeBuffers[i].active = false;
+  }
+  Serial.printf("Gateway: Initialized %d universe buffers\n", MAX_UNIVERSES);
+}
+#endif
+
+// ═══════════════════════════════════════════════════════════════
 // OLED
 // ═══════════════════════════════════════════════════════════════
 #define SCREEN_WIDTH 128
@@ -717,6 +760,133 @@ void handleJsonCommand(const String& jsonStr) {
 
   unsigned long fadeMs = doc["fade"] | 0;
 
+  // Extract universe from command (defaults to currentUniverse for backwards compatibility)
+  int cmdUniverse = doc["universe"] | currentUniverse;
+
+#ifdef ENABLE_ESPNOW_GATEWAY
+  // GATEWAY MODE: Route commands to appropriate universe buffer
+  UniverseBuffer* univBuf = getUniverseBuffer(cmdUniverse);
+
+  // Scene data (array) - PRIMARY COMMAND FROM PI
+  if (strcmp(cmd, "scene") == 0) {
+    int startCh = doc["ch"] | 1;
+    JsonArray data = doc["data"];
+    if (data && univBuf) {
+      int idx = 0;
+      for (JsonVariant v : data) {
+        int ch = startCh + idx;
+        if (ch > 512) break;
+        univBuf->data[ch - 1] = v.as<uint8_t>();
+        idx++;
+      }
+      univBuf->dirty = true;
+      univBuf->active = true;
+      univBuf->lastUpdateTime = millis();
+      univBuf->framesReceived++;
+      Serial.printf("GW: U%d scene %d ch, fade=%lums\n", cmdUniverse, idx, fadeMs);
+    } else if (!univBuf) {
+      Serial.printf("GW: Invalid universe %d (max %d)\n", cmdUniverse, MAX_UNIVERSES);
+    }
+
+    // Also update local dmxData if this is our local universe (for local DMX output)
+    if (cmdUniverse == currentUniverse && data) {
+      int startCh2 = doc["ch"] | 1;
+      int idx2 = 0;
+      for (JsonVariant v : data) {
+        int ch = startCh2 + idx2;
+        if (ch > 512) break;
+        startFade(ch, v.as<uint8_t>(), fadeMs);
+        idx2++;
+      }
+    }
+  }
+  // Single channel set
+  else if (strcmp(cmd, "set") == 0) {
+    int ch = doc["ch"];
+    int val = doc["val"];
+    if (ch >= 1 && ch <= 512 && val >= 0 && val <= 255) {
+      if (univBuf) {
+        univBuf->data[ch - 1] = val;
+        univBuf->dirty = true;
+        univBuf->active = true;
+        univBuf->lastUpdateTime = millis();
+      }
+      if (cmdUniverse == currentUniverse) {
+        startFade(ch, val, fadeMs);
+      }
+    }
+  }
+  // Sparse channel updates
+  else if (strcmp(cmd, "set_channels") == 0) {
+    JsonObject channels = doc["channels"];
+    if (channels && univBuf) {
+      for (JsonPair kv : channels) {
+        int ch = atoi(kv.key().c_str());
+        int val = kv.value().as<int>();
+        if (ch >= 1 && ch <= 512 && val >= 0 && val <= 255) {
+          univBuf->data[ch - 1] = val;
+          if (cmdUniverse == currentUniverse) {
+            startFade(ch, val, fadeMs);
+          }
+        }
+      }
+      univBuf->dirty = true;
+      univBuf->active = true;
+      univBuf->lastUpdateTime = millis();
+    }
+  }
+  // Blackout - affects specified universe (or all if no universe specified)
+  else if (strcmp(cmd, "blackout") == 0) {
+    stopPlayback();
+    bool allUniverses = !doc["universe"].is<int>();  // No universe = blackout all
+
+    for (int u = 1; u <= MAX_UNIVERSES; u++) {
+      if (allUniverses || u == cmdUniverse) {
+        UniverseBuffer* buf = getUniverseBuffer(u);
+        if (buf && buf->active) {
+          memset(buf->data, 0, 512);
+          buf->dirty = true;
+          buf->lastUpdateTime = millis();
+          Serial.printf("GW: U%d blackout\n", u);
+        }
+      }
+    }
+    // Local blackout
+    for (int i = 1; i <= 512; i++) {
+      startFade(i, 0, fadeMs);
+    }
+  }
+  // All channels same value
+  else if (strcmp(cmd, "all") == 0) {
+    int val = doc["val"] | 0;
+    if (univBuf) {
+      memset(univBuf->data, val, 512);
+      univBuf->dirty = true;
+      univBuf->active = true;
+      univBuf->lastUpdateTime = millis();
+    }
+    if (cmdUniverse == currentUniverse) {
+      for (int i = 1; i <= 512; i++) {
+        startFade(i, val, fadeMs);
+      }
+    }
+  }
+  // Gateway stats command
+  else if (strcmp(cmd, "gw_stats") == 0) {
+    Serial.println("═══ GATEWAY UNIVERSE STATS ═══");
+    for (int u = 1; u <= MAX_UNIVERSES; u++) {
+      UniverseBuffer* buf = getUniverseBuffer(u);
+      if (buf && buf->active) {
+        Serial.printf("  U%d: rx=%lu tx=%lu seq=%lu last=%lums ago\n",
+          u, buf->framesReceived, buf->framesBroadcast, buf->seq,
+          millis() - buf->lastUpdateTime);
+      }
+    }
+    Serial.println("═══════════════════════════════");
+  }
+#else
+  // NODE MODE: Apply commands to local dmxData only
+
   // Single channel set
   if (strcmp(cmd, "set") == 0) {
     int ch = doc["ch"];
@@ -766,8 +936,11 @@ void handleJsonCommand(const String& jsonStr) {
       startFade(i, val, fadeMs);
     }
   }
+#endif
+
+  // COMMON COMMANDS (both gateway and node modes)
   // Store scene
-  else if (strcmp(cmd, "store_scene") == 0) {
+  if (strcmp(cmd, "store_scene") == 0) {
     storeScene(doc);
   }
   // Store chase
@@ -1167,6 +1340,10 @@ void setup() {
   memset(scenes, 0, sizeof(scenes));
   memset(chases, 0, sizeof(chases));
 
+#ifdef ENABLE_ESPNOW_GATEWAY
+  initUniverseBuffers();
+#endif
+
   // Generate node ID first (needed for boot banner)
   uint8_t mac[6];
   WiFi.macAddress(mac);
@@ -1437,11 +1614,44 @@ void loop() {
     lastDmxSend = now;
 
 #ifdef ENABLE_ESPNOW_GATEWAY
-    // Broadcast current DMX frame to ESP-NOW nodes (both WIRED and WIRELESS modes)
-    // This ensures ESP-NOW nodes get synchronized updates at the same rate as local DMX
-    static uint32_t espnowSeq = 0;
-    espnowSeq++;
-    EspNowGateway::broadcastFrame(currentUniverse, dmxData + 1, 0, espnowSeq);
+    // MULTI-UNIVERSE BROADCAST: Send all active/dirty universes to ESP-NOW nodes
+    // Strategy:
+    //   - Dirty universes: broadcast immediately (data changed)
+    //   - Active universes: broadcast at keepalive rate (2Hz) to maintain sync
+    //   - Inactive universes: skip (no data ever received)
+
+    for (int u = 1; u <= MAX_UNIVERSES; u++) {
+      UniverseBuffer* buf = getUniverseBuffer(u);
+      if (!buf || !buf->active) continue;
+
+      bool shouldBroadcast = false;
+      const char* reason = "";
+
+      // Check if dirty (data changed since last broadcast)
+      if (buf->dirty) {
+        shouldBroadcast = true;
+        reason = "dirty";
+        buf->dirty = false;
+      }
+      // Check keepalive interval (broadcast unchanged data periodically)
+      else if (now - buf->lastBroadcastTime >= UNIVERSE_KEEPALIVE_MS) {
+        shouldBroadcast = true;
+        reason = "keepalive";
+      }
+
+      if (shouldBroadcast) {
+        buf->seq++;
+        bool ok = EspNowGateway::broadcastFrame(u, buf->data, 0, buf->seq);
+        if (ok) {
+          buf->framesBroadcast++;
+          buf->lastBroadcastTime = now;
+        }
+        // Debug: log every 100th frame per universe
+        if (buf->framesBroadcast % 100 == 1) {
+          Serial.printf("GW: U%d tx=%lu (%s)\n", u, buf->framesBroadcast, reason);
+        }
+      }
+    }
 #endif
   }
 
@@ -1456,9 +1666,25 @@ void loop() {
   static unsigned long lastDebug = 0;
   if (now - lastDebug >= 5000) {
     if (operationMode == MODE_WIRED) {
+#ifdef ENABLE_ESPNOW_GATEWAY
+      // Gateway mode: show multi-universe stats
+      Serial.printf("GW Cmds:%lu DMX:%lu | Active universes: ", commandsReceived, dmxFramesSent);
+      int activeCount = 0;
+      for (int u = 1; u <= MAX_UNIVERSES; u++) {
+        UniverseBuffer* buf = getUniverseBuffer(u);
+        if (buf && buf->active) {
+          if (activeCount > 0) Serial.print(", ");
+          Serial.printf("U%d(rx:%lu/tx:%lu)", u, buf->framesReceived, buf->framesBroadcast);
+          activeCount++;
+        }
+      }
+      if (activeCount == 0) Serial.print("none");
+      Serial.println();
+#else
       Serial.printf("WIRED Cmds:%lu DMX:%lu Ch1-3:[%d,%d,%d]\n",
         commandsReceived, dmxFramesSent,
         dmxData[1], dmxData[2], dmxData[3]);
+#endif
     } else {
 #ifdef ENABLE_ESPNOW
       if (isPaired) {
