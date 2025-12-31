@@ -1,24 +1,36 @@
-# AETHER Pulse sACN/E1.31 Runbook
+# AETHER Pulse sACN/E1.31 + UART Gateway Runbook
 
 ## Architecture Overview
 
 ```
-Pi (aether-core v4.0)
+Pi (aether-core v4.1)
     |
     +-- OLA (Open Lighting Architecture)
+    |       |
+    |       +-- sACN/E1.31 multicast (239.255.0.{universe})
+    |               |
+    |               +-- WiFi ESP32 Nodes (pulse-sacn firmware v2.2.0)
+    |                       |
+    |                       +-- Channel Slice (configurable window)
+    |                       |
+    |                       +-- RS485/DMX output @ 40Hz
+    |
+    +-- UART Gateway (/dev/serial0 @ 115200 baud)
             |
-            +-- sACN/E1.31 multicast (239.255.0.{universe})
+            +-- Gateway ESP32 (pulse-gateway firmware v2.2.0)
                     |
-                    +-- ESP32 Nodes (pulse-sacn firmware v2.2.0)
-                            |
-                            +-- Channel Slice (configurable window)
-                            |
-                            +-- RS485/DMX output @ 40Hz (fixed rate)
+                    +-- Channel Slice (same as WiFi nodes)
+                    |
+                    +-- RS485/DMX output @ 40Hz (fixed rate)
 ```
 
-**Transport**: sACN/E1.31 multicast over WiFi
-**Config Commands**: UDP JSON on port 8888
-**Discovery**: UDP broadcast on port 9999
+**Transport Options**:
+- **WiFi Nodes**: sACN/E1.31 multicast over WiFi
+- **Gateway Node**: Direct UART from Pi GPIO (wired, reliable)
+
+**Gateway + WiFi Sharing**: Both can share the same universe via channel slices
+**Config Commands**: UDP JSON on port 8888 (WiFi), UART JSON (Gateway)
+**Discovery**: UDP broadcast on port 9999 (WiFi), Heartbeat via UART (Gateway)
 **Multi-sender policy**: last-wins (documented below)
 
 ---
@@ -71,25 +83,25 @@ python3 aether-core.py
 **Expected startup output:**
 ```
 ============================================================
-AETHER DMX Controller v4.0.0
-Transport: sACN/E1.31 via OLA
+AETHER DMX Controller v4.1.0
+Transport: sACN/E1.31 via OLA + UART Gateway
 ============================================================
 OLA/sACN output enabled
+UART Gateway: Connected to /dev/serial0 @ 115200 baud
 API server on port 8891
 Discovery on UDP 9999
-OLA/sACN output enabled
 ============================================================
 ```
 
-### 2. ESP32 Nodes (aether-pulse)
+### 2. ESP32 WiFi Nodes (aether-pulse)
 
 ```bash
-# Build firmware
+# Build WiFi firmware
 cd aether-pulse/hybrid
-pio run
+pio run -e pulse
 
 # Flash to ESP32
-pio run -t upload
+pio run -e pulse -t upload
 
 # Monitor serial output
 pio device monitor
@@ -106,6 +118,53 @@ pio device monitor
   Output:    40 fps (fixed rate)
   Policy:    multi-sender=last-wins
 ═══════════════════════════════════════════════════
+
+### 3. UART Gateway Node (pulse-gateway)
+
+The gateway node connects directly to Pi GPIO pins for wired DMX output.
+
+**Hardware Connection:**
+```
+Pi GPIO 14 (TX) ──► ESP32 GPIO 3 (RX)
+Pi GPIO 15 (RX) ◄── ESP32 GPIO 1 (TX)
+Common Ground   ──── Common Ground
+```
+
+**Build & Flash:**
+```bash
+# Build gateway firmware
+cd aether-pulse/hybrid
+pio run -e pulse_gateway
+
+# Flash to ESP32 (via USB - NOT the Pi GPIO connection)
+pio run -e pulse_gateway -t upload
+
+# Monitor serial output
+pio device monitor
+```
+
+**Expected boot output:**
+```
+═══════════════════════════════════════════════════
+  AETHER Pulse Gateway - Wired DMX Node
+═══════════════════════════════════════════════════
+  Firmware:  pulse-gateway v2.2.0
+  Node ID:   gateway-XXXX
+  Transport: UART (Pi GPIO direct)
+  Output:    40 fps (fixed rate)
+═══════════════════════════════════════════════════
+
+Config: Universe=1, Slice=1-512 (zero_outside), Name=GATEWAY
+UART: Listening for Pi commands @ 115200 baud
+DMX: Output initialized @ 40 fps (UART1)
+```
+
+**Gateway Features:**
+- Receives DMX data directly from Pi via UART (no WiFi required)
+- Supports channel slice configuration (same as WiFi nodes)
+- Auto-registers with Pi via heartbeat messages
+- Can share universe with WiFi nodes using different channel slices
+- Reliable wired connection for critical installations
 
 Config: Universe=1, Slice=1-512 (zero_outside), Name=PULSE-XXXX
 Connecting to AetherDMX...
@@ -379,6 +438,60 @@ echo '{"cmd":"status"}' | nc -u <node_ip> 8888
 - Node receives and applies configuration
 - Frontend UI continues to work (backward compatible)
 
+### Test 9: UART Gateway Basic Operation
+
+**Goal**: Verify gateway receives DMX via UART and outputs correctly.
+
+```bash
+# On Pi, ensure aether-core is running and gateway is connected
+python3 aether-core.py
+
+# Check startup log for:
+# ✅ UART Gateway: Connected to /dev/serial0 @ 115200 baud
+
+# Send DMX to universe 1 (gateway should receive via UART)
+curl -X POST http://localhost:8891/api/dmx/set \
+  -H "Content-Type: application/json" \
+  -d '{"universe":1,"channels":{"1":255,"2":128,"3":64}}'
+
+# Expected gateway serial output:
+# STATUS @ Xs | gateway-XXXX | Universe 1
+#   UART:     LIVE (last 0ms ago)
+#   Channels: preview=[255,128,64,0]
+```
+
+**Pass criteria**:
+- Gateway auto-registers via heartbeat
+- Pi sends DMX via UART (log shows `+ UART`)
+- Gateway outputs correct DMX values
+- Gateway OLED shows live status
+
+### Test 10: Gateway + WiFi Shared Universe
+
+**Goal**: Verify gateway and WiFi node can share same universe with different slices.
+
+```bash
+# Configure gateway for channels 1-256 (via serial config or heartbeat auto-config)
+# Gateway will use slice from its NVS or config command
+
+# Configure WiFi node for channels 257-512
+echo '{"cmd":"config","universe":1,"channel_start":257,"channel_end":512}' | nc -u <wifi_node_ip> 8888
+
+# Send full-universe test pattern
+ola_set_dmx -u 1 -d $(python3 -c "print(','.join(str(i%256) for i in range(512)))")
+
+# Expected:
+# - Gateway outputs channels 1-256, zeros for 257-512
+# - WiFi node outputs channels 257-512, zeros for 1-256
+# - Both receive same universe data
+```
+
+**Pass criteria**:
+- Gateway receives via UART, WiFi node receives via sACN
+- Each outputs only its slice
+- No interference between wired and wireless paths
+- Pi logs show both OLA and UART sends
+
 ---
 
 ## Expected Log Examples
@@ -477,15 +590,44 @@ ola_streaming_client -u 1
 ola_e131 --help
 ```
 
+### UART Gateway not connecting
+
+1. Check Pi serial port enabled: `ls -la /dev/serial0`
+2. Ensure nothing else is using the port (no getty on /dev/serial0)
+3. Check GPIO wiring: TX→RX, RX→TX, Ground
+4. Verify baud rate matches: 115200 on both sides
+5. Check aether-core log: `UART Gateway: Connected to...`
+
+```bash
+# Disable serial console (if needed)
+sudo raspi-config
+# → Interface Options → Serial Port
+# → Login shell: No, Hardware: Yes
+
+# Test serial port
+echo '{"cmd":"status"}' > /dev/serial0
+
+# Check for gateway heartbeats
+cat /dev/serial0 | head -5
+```
+
+### Gateway not receiving DMX
+
+1. Check universe matches: Gateway universe = Pi output universe
+2. Verify gateway is registered: `curl http://localhost:8891/api/nodes | grep gateway`
+3. Check Pi log for `+ UART` in output messages
+4. Ensure gateway node status is 'online' in database
+
 ---
 
 ## Files Reference
 
 | File | Purpose |
 |------|---------|
-| `aether-core/aether-core.py` | Pi controller (v4.0.0) |
-| `aether-pulse/hybrid/src/main.cpp` | ESP32 firmware (v2.2.0) |
-| `aether-pulse/hybrid/platformio.ini` | Build config |
+| `aether-core/aether-core.py` | Pi controller (v4.1.0) - OLA + UART gateway |
+| `aether-pulse/hybrid/src/main.cpp` | ESP32 WiFi firmware (v2.2.0) |
+| `aether-pulse/hybrid/src/gateway_main.cpp` | ESP32 Gateway firmware (v2.2.0) |
+| `aether-pulse/hybrid/platformio.ini` | Build config (pulse + pulse_gateway envs) |
 | `aether-pulse/hybrid/include/firmware_identity.h` | Version/identity |
 
 ---
@@ -494,6 +636,7 @@ ola_e131 --help
 
 | Version | Date | Changes |
 |---------|------|---------|
+| 2.2.0 (gateway) | 2024-12-30 | UART gateway firmware: direct Pi GPIO connection, shares universe with WiFi |
 | 2.2.0 | 2024-12-30 | Channel slice feature: shared universe, configurable channel windows |
 | 2.1.0 | 2024-12-30 | Multi-sender tracking (last-wins), status logging, timing separation |
 | 2.0.0 | 2024-12-30 | Complete rewrite: sACN/E1.31 only, removed ESP-NOW/UART |
