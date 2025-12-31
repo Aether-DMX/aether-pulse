@@ -113,6 +113,7 @@ volatile bool dmxDirty = false;          // Flag for new data received
 
 String nodeId = "";
 String nodeName = "";
+String deviceLabel = "";  // Always shows PULSE-XXXX for hardware identification
 
 // Configuration (stored in NVS)
 bool isPaired = false;        // Whether node has been configured/paired
@@ -722,10 +723,9 @@ void updateOLED() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
 
-    // Header: Node name + signal
+    // Header: Device label (permanent PULSE-XXXX identifier) + signal
     display.setCursor(0, 0);
-    String displayName = nodeName.substring(0, 12);
-    display.print(displayName);
+    display.print(deviceLabel);
 
     if (WiFi.status() == WL_CONNECTED) {
         drawSignalBars(100, 0, WiFi.RSSI());
@@ -845,12 +845,17 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);
 
-    // Generate node ID from MAC
+    // Generate node ID and device label from MAC
     uint8_t mac[6];
     WiFi.macAddress(mac);
     char macStr[13];
     sprintf(macStr, "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     nodeId = String("pulse-") + String(macStr).substring(8);
+
+    // Device label is permanent identifier shown on OLED (never changes)
+    char labelStr[12];
+    sprintf(labelStr, "PULSE-%02X%02X", mac[4], mac[5]);
+    deviceLabel = String(labelStr);
 
     // Boot banner
     Serial.println();
