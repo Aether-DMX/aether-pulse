@@ -538,6 +538,31 @@ void handleConfigCommand(const String& jsonStr) {
         logStatus();
         sendRegistration();
     }
+    // Unpair - reset to defaults and clear saved config
+    else if (strcmp(cmd, "unpair") == 0) {
+        Serial.println("═══════════════════════════════════════════════════");
+        Serial.println("  UNPAIR: Resetting to factory defaults");
+        Serial.println("═══════════════════════════════════════════════════");
+
+        // Reset to defaults
+        sourceUniverse = 1;
+        sliceStart = 1;
+        sliceEnd = 512;
+        sliceMode = SLICE_ZERO_OUTSIDE;
+        nodeName = "";  // Will use PULSE-XXXX from MAC
+
+        // Clear saved config from NVS
+        preferences.begin("aether", false);
+        preferences.clear();
+        preferences.end();
+
+        Serial.println("Config cleared. Node ready for re-pairing.");
+        Serial.printf("Defaults: Universe=%d, Slice=%d-%d, Mode=zero_outside\n",
+            sourceUniverse, sliceStart, sliceEnd);
+
+        // Re-register with Pi to show as unpaired
+        sendRegistration();
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════
