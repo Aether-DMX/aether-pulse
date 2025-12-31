@@ -115,7 +115,8 @@ String nodeId = "";
 String nodeName = "";
 
 // Configuration (stored in NVS)
-int sourceUniverse = 1;       // sACN universe to listen on (1-63999)
+bool isPaired = false;        // Whether node has been configured/paired
+int sourceUniverse = 0;       // sACN universe to listen on (0 = not configured)
 int sliceStart = 1;           // First channel of slice (1-512)
 int sliceEnd = 512;           // Last channel of slice (1-512)
 SliceMode sliceMode = SLICE_ZERO_OUTSIDE;  // How to handle channels outside slice
@@ -159,17 +160,24 @@ void processSacnPacket(e131_packet_t* packet);
 // ═══════════════════════════════════════════════════════════════════
 void loadConfig() {
     preferences.begin("aether", true);
-    sourceUniverse = preferences.getInt("universe", 1);
+    isPaired = preferences.getBool("is_paired", false);
+    sourceUniverse = preferences.getInt("universe", 0);  // 0 = not configured
     sliceStart = preferences.getInt("slice_start", 1);
     sliceEnd = preferences.getInt("slice_end", 512);
     sliceMode = (SliceMode)preferences.getInt("slice_mode", SLICE_ZERO_OUTSIDE);
     nodeName = preferences.getString("name", "");
     preferences.end();
 
-    // Validate universe range (sACN allows 1-63999)
-    if (sourceUniverse < 1 || sourceUniverse > 63999) {
-        Serial.printf("⚠️ Invalid universe %d, resetting to 1\n", sourceUniverse);
-        sourceUniverse = 1;
+    // If not paired, universe should be 0 (waiting for config)
+    if (!isPaired) {
+        sourceUniverse = 0;
+    }
+
+    // Validate universe range (sACN allows 1-63999, 0 = not configured)
+    if (sourceUniverse != 0 && (sourceUniverse < 1 || sourceUniverse > 63999)) {
+        Serial.printf("⚠️ Invalid universe %d, resetting to unpaired\n", sourceUniverse);
+        sourceUniverse = 0;
+        isPaired = false;
     }
 
     // Validate slice range
@@ -193,14 +201,19 @@ void loadConfig() {
         nodeName = String("PULSE-") + String(macStr);
     }
 
-    Serial.printf("Config: Universe=%d, Slice=%d-%d, Mode=%s, Name=%s\n",
-                  sourceUniverse, sliceStart, sliceEnd,
-                  sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through",
-                  nodeName.c_str());
+    if (isPaired) {
+        Serial.printf("Config: Universe=%d, Slice=%d-%d, Mode=%s, Name=%s\n",
+                      sourceUniverse, sliceStart, sliceEnd,
+                      sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through",
+                      nodeName.c_str());
+    } else {
+        Serial.printf("Config: WAITING FOR PAIRING (Name=%s)\n", nodeName.c_str());
+    }
 }
 
 void saveConfig() {
     preferences.begin("aether", false);
+    preferences.putBool("is_paired", isPaired);
     preferences.putInt("universe", sourceUniverse);
     preferences.putInt("slice_start", sliceStart);
     preferences.putInt("slice_end", sliceEnd);
@@ -245,6 +258,12 @@ void initWiFi() {
 // sACN/E1.31 RECEPTION
 // ═══════════════════════════════════════════════════════════════════
 void initSacn() {
+    // Only start sACN if paired with a valid universe
+    if (!isPaired || sourceUniverse == 0) {
+        Serial.println("sACN: Not starting - waiting for pairing");
+        return;
+    }
+
     // Universe parameter is used correctly - no hardcoding to 1
     if (e131.begin(E131_MULTICAST, sourceUniverse, 1)) {
         Serial.printf("sACN: Listening on Universe %d (multicast 239.255.0.%d)\n",
@@ -264,10 +283,13 @@ void changeUniverse(int newUniverse) {
         Serial.printf("⚠️ Invalid universe %d (must be 1-63999)\n", newUniverse);
         return;
     }
-    if (newUniverse == sourceUniverse) return;
+    if (newUniverse == sourceUniverse && isPaired) return;
 
     Serial.printf("Universe: %d -> %d\n", sourceUniverse, newUniverse);
     sourceUniverse = newUniverse;
+
+    // Setting a universe means we're now paired
+    isPaired = true;
 
     // Reinitialize sACN with new universe
     initSacn();
@@ -499,10 +521,15 @@ void handleConfigCommand(const String& jsonStr) {
         if (sliceEnd < sliceStart) sliceEnd = sliceStart;
 
         if (configChanged) {
+            // Mark as paired when config is received (universe must be set)
+            if (sourceUniverse > 0) {
+                isPaired = true;
+            }
             saveConfig();
-            Serial.printf("Config updated: Slice=%d-%d, Mode=%s\n",
-                sliceStart, sliceEnd,
-                sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through");
+            Serial.printf("Config updated: Universe=%d, Slice=%d-%d, Mode=%s, Paired=%s\n",
+                sourceUniverse, sliceStart, sliceEnd,
+                sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through",
+                isPaired ? "YES" : "NO");
         }
         sendRegistration();
     }
@@ -544,21 +571,31 @@ void handleConfigCommand(const String& jsonStr) {
         Serial.println("  UNPAIR: Resetting to factory defaults");
         Serial.println("═══════════════════════════════════════════════════");
 
-        // Reset to defaults
-        sourceUniverse = 1;
+        // Reset to unpaired state
+        isPaired = false;
+        sourceUniverse = 0;  // No universe - waiting for config
         sliceStart = 1;
         sliceEnd = 512;
         sliceMode = SLICE_ZERO_OUTSIDE;
-        nodeName = "";  // Will use PULSE-XXXX from MAC
+
+        // Generate default name from MAC
+        uint8_t mac[6];
+        WiFi.macAddress(mac);
+        char macStr[5];
+        sprintf(macStr, "%02X%02X", mac[4], mac[5]);
+        nodeName = String("PULSE-") + String(macStr);
 
         // Clear saved config from NVS
         preferences.begin("aether", false);
         preferences.clear();
         preferences.end();
 
-        Serial.println("Config cleared. Node ready for re-pairing.");
-        Serial.printf("Defaults: Universe=%d, Slice=%d-%d, Mode=zero_outside\n",
-            sourceUniverse, sliceStart, sliceEnd);
+        // Note: ESPAsyncE131 doesn't have end() method
+        // The node will stop processing sACN since sourceUniverse is now 0
+        // On reboot, initSacn() won't start since isPaired is false
+
+        Serial.println("Config cleared. Node waiting for pairing.");
+        Serial.println("Universe: NONE (waiting for config)");
 
         // Re-register with Pi to show as unpaired
         sendRegistration();
@@ -571,11 +608,12 @@ void handleConfigCommand(const String& jsonStr) {
 void sendRegistration() {
     if (WiFi.status() != WL_CONNECTED) return;
 
-    // Build registration JSON with both new and legacy field names for compatibility
-    char json[640];
+    // Build registration JSON with pairing status
+    char json[700];
     snprintf(json, sizeof(json),
         "{\"type\":\"register\",\"node_id\":\"%s\",\"hostname\":\"%s\","
         "\"mac\":\"%s\",\"ip\":\"%s\",\"universe\":%d,"
+        "\"is_paired\":%s,\"waiting_for_config\":%s,"
         "\"slice_start\":%d,\"slice_end\":%d,\"slice_mode\":\"%s\","
         "\"startChannel\":%d,\"channelCount\":%d,"
         "\"firmware\":\"pulse-sacn\",\"version\":\"%s\","
@@ -584,6 +622,8 @@ void sendRegistration() {
         nodeId.c_str(), nodeName.c_str(),
         WiFi.macAddress().c_str(), WiFi.localIP().toString().c_str(),
         sourceUniverse,
+        isPaired ? "true" : "false",
+        isPaired ? "false" : "true",  // waiting_for_config = !isPaired
         sliceStart, sliceEnd,
         sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through",
         sliceStart, sliceEnd - sliceStart + 1,  // Legacy fields for compatibility
@@ -697,6 +737,26 @@ void updateOLED() {
     // Separator
     display.drawLine(0, 12, 128, 12, SSD1306_WHITE);
 
+    // Check if node is waiting for configuration
+    if (!isPaired || sourceUniverse == 0) {
+        // WAITING FOR CONFIG mode - show prominent message
+        display.setTextSize(1);
+        display.setCursor(0, 18);
+        display.print("WAITING FOR");
+        display.setCursor(0, 28);
+        display.print("CONFIGURATION");
+
+        display.setTextSize(1);
+        display.setCursor(0, 42);
+        display.print("Use AETHER Portal");
+        display.setCursor(0, 52);
+        display.print("to pair this node");
+
+        display.display();
+        return;
+    }
+
+    // PAIRED mode - show normal status
     // Universe (large) - supports any universe, not just 1
     display.setTextSize(2);
     display.setCursor(0, 18);
@@ -834,7 +894,12 @@ void setup() {
     initDmxOutput();
 
     Serial.println("\n═══════════════════════════════════════════════════");
-    Serial.printf("  READY - Slice %d-%d on Universe %d\n", sliceStart, sliceEnd, sourceUniverse);
+    if (isPaired && sourceUniverse > 0) {
+        Serial.printf("  READY - Slice %d-%d on Universe %d\n", sliceStart, sliceEnd, sourceUniverse);
+    } else {
+        Serial.println("  WAITING FOR CONFIGURATION");
+        Serial.println("  Use AETHER Portal to pair this node");
+    }
     Serial.println("═══════════════════════════════════════════════════\n");
 
     // Initial status log
