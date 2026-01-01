@@ -186,7 +186,7 @@ int sliceEnd = 512;           // Last channel of slice (1-512)
 SliceMode sliceMode = SLICE_ZERO_OUTSIDE;  // How to handle channels outside slice
 
 // Offline playback state
-OfflineMode offlineMode = OFFLINE_LOOP;     // Default: loop last frames when offline
+OfflineMode offlineMode = OFFLINE_NONE;     // Disabled for UDPJSON     // Default: loop last frames when offline
 LoopBuffer loopBuffer;                       // Ring buffer for loop playback
 ChaseDefinition storedChase;                 // Chase definition from NVS
 bool isOffline = false;                      // Currently in offline playback mode
@@ -327,7 +327,7 @@ void initOfflinePlayback() {
 
     // Load offline mode preference
     preferences.begin("aether", true);
-    offlineMode = (OfflineMode)preferences.getInt("offline_mode", OFFLINE_LOOP);
+    offlineMode = OFFLINE_NONE;  // Force OFFLINE_NONE for UDPJSON mode
     preferences.end();
 
     // Load stored chase from NVS
@@ -1532,35 +1532,35 @@ void loop() {
     // ─────────────────────────────────────────────────────────────────
     // OFFLINE PLAYBACK - Switch to offline mode after timeout
     // ─────────────────────────────────────────────────────────────────
-    if (lastSacnReceived > 0 && (now - lastSacnReceived) > SACN_TIMEOUT_MS) {
-        // Start offline mode if not already
-        if (!isOffline) {
-            startOfflineMode();
-        }
-
-        // Handle offline playback based on mode
-        if (offlineMode == OFFLINE_NONE) {
-            // Gradual fade to black (simple linear fade)
-            static unsigned long lastFadeStep = 0;
-            if (now - lastFadeStep > 50) {
-                bool anyActive = false;
-                for (int i = 1; i <= 512; i++) {
-                    if (dmxIn[i] > 0) {
-                        dmxIn[i] = (dmxIn[i] > 5) ? dmxIn[i] - 5 : 0;
-                        anyActive = true;
-                    }
-                }
-                lastFadeStep = now;
-                if (!anyActive) {
-                    lastSacnReceived = 0;
-                    Serial.println("sACN: Fade to black complete");
-                }
-            }
-        } else {
-            // Loop or Chase playback
-            playOfflineFrame();
-        }
-    }
+    // DISABLED:     if (lastSacnReceived > 0 && (now - lastSacnReceived) > SACN_TIMEOUT_MS) {
+    // DISABLED:         // Start offline mode if not already
+    // DISABLED:         if (!isOffline) {
+    // DISABLED:             startOfflineMode();
+    // DISABLED:         }
+    // DISABLED: 
+    // DISABLED:         // Handle offline playback based on mode
+    // DISABLED:         if (offlineMode == OFFLINE_NONE) {
+    // DISABLED:             // Gradual fade to black (simple linear fade)
+    // DISABLED:             static unsigned long lastFadeStep = 0;
+    // DISABLED:             if (now - lastFadeStep > 50) {
+    // DISABLED:                 bool anyActive = false;
+    // DISABLED:                 for (int i = 1; i <= 512; i++) {
+    // DISABLED:                     if (dmxIn[i] > 0) {
+    // DISABLED:                         dmxIn[i] = (dmxIn[i] > 5) ? dmxIn[i] - 5 : 0;
+    // DISABLED:                         anyActive = true;
+    // DISABLED:                     }
+    // DISABLED:                 }
+    // DISABLED:                 lastFadeStep = now;
+    // DISABLED:                 if (!anyActive) {
+    // DISABLED:                     lastSacnReceived = 0;
+    // DISABLED:                     Serial.println("sACN: Fade to black complete");
+    // DISABLED:                 }
+    // DISABLED:             }
+    // DISABLED:         } else {
+    // DISABLED:             // Loop or Chase playback
+    // DISABLED:             playOfflineFrame();
+    // DISABLED:         }
+    // DISABLED:     }
 
     // ─────────────────────────────────────────────────────────────────
     // UDPJSON DMX COMMANDS (Port 6455) - Primary DMX transport
