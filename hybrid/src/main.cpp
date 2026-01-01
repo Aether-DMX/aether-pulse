@@ -1,20 +1,25 @@
 /**
- * AETHER Pulse - Pure sACN/E1.31 DMX Node v2.2.0
+ * AETHER Pulse - UDPJSON DMX Node v2.5.0
  *
- * Clean, professional wireless DMX receiver using industry-standard sACN.
- * No ESP-NOW, no complex transport layers - just sACN multicast over WiFi.
+ * Wireless DMX receiver using direct UDP JSON protocol.
+ * Receives DMX commands from AETHER Core on port 6455.
  *
  * Features:
- * - sACN/E1.31 multicast reception (works with OLA, QLC+, any sACN source)
+ * - UDPJSON DMX protocol (set, fade, blackout, ping/pong)
  * - Channel slice output (multiple nodes can share a universe)
- * - UDP JSON for configuration commands only (not DMX data)
  * - RS485/DMX output at configurable fixed rate (default 40Hz)
  * - Hold-last-frame on signal loss with fade to black
- * - Multi-sender detection with last-wins policy
+ * - Non-blocking fade engine
  * - Periodic status logging for field debugging
  * - OLED status display
  * - OTA firmware updates
  * - NVS configuration storage
+ *
+ * Protocol (port 6455):
+ * - {"type":"set","universe":2,"channels":{"1":255,"2":128},"ts":...}
+ * - {"type":"fade","universe":2,"duration_ms":1000,"channels":{"1":0},"ts":...}
+ * - {"type":"blackout","universe":2,"ts":...}
+ * - {"type":"ping","ts":...} -> responds with pong
  *
  * Build: pio run
  */
@@ -34,7 +39,7 @@
 // ═══════════════════════════════════════════════════════════════════
 // VERSION
 // ═══════════════════════════════════════════════════════════════════
-#define FIRMWARE_VERSION "2.2.0"
+#define FIRMWARE_VERSION "2.5.0"
 
 // ═══════════════════════════════════════════════════════════════════
 // PIN DEFINITIONS
@@ -56,6 +61,7 @@ const char* WIFI_PASSWORD = "";  // Open network
 
 const int CONFIG_PORT = 8888;         // UDP port for JSON config commands
 const int DISCOVERY_PORT = 9999;      // UDP port for discovery/heartbeat
+const int UDPJSON_DMX_PORT = 6455;    // SSOT: Port for UDPJSON DMX commands
 const char* CONTROLLER_IP = "192.168.50.1";  // Pi's IP on AetherDMX network
 
 // ═══════════════════════════════════════════════════════════════════
@@ -64,9 +70,17 @@ const char* CONTROLLER_IP = "192.168.50.1";  // Pi's IP on AetherDMX network
 #define DMX_PACKET_SIZE 513
 #define DMX_OUTPUT_FPS 40               // Fixed output rate (25ms interval)
 #define DMX_OUTPUT_INTERVAL_MS (1000 / DMX_OUTPUT_FPS)
-#define SACN_TIMEOUT_MS 5000            // Hold last frame for 5s, then fade
+#define SACN_TIMEOUT_MS 3000            // Switch to offline mode after 3s
 #define SACN_STALE_LOG_INTERVAL_MS 2000 // Rate-limit stale universe logs
 #define STATUS_LOG_INTERVAL_MS 10000    // Status report every 10s
+
+// ═══════════════════════════════════════════════════════════════════
+// OFFLINE PLAYBACK CONFIGURATION
+// ═══════════════════════════════════════════════════════════════════
+#define LOOP_BUFFER_FRAMES 80           // ~2 seconds at 40fps
+#define LOOP_BUFFER_CHANNELS 128        // Only buffer first 128 channels (memory constraint)
+#define MAX_CHASE_STEPS 16              // Max steps in a stored chase
+#define CHASE_STORAGE_KEY "chase_data"  // NVS key for chase storage
 
 // ═══════════════════════════════════════════════════════════════════
 // SLICE MODE ENUM
@@ -74,6 +88,40 @@ const char* CONTROLLER_IP = "192.168.50.1";  // Pi's IP on AetherDMX network
 enum SliceMode {
     SLICE_ZERO_OUTSIDE = 0,      // Channels outside slice are forced to 0 (default)
     SLICE_PASS_THROUGH = 1       // Channels outside slice pass through from input
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// OFFLINE PLAYBACK MODE
+// ═══════════════════════════════════════════════════════════════════
+enum OfflineMode {
+    OFFLINE_NONE = 0,            // No offline playback - fade to black
+    OFFLINE_LOOP = 1,            // Loop the last N seconds of DMX
+    OFFLINE_CHASE = 2,           // Play stored chase definition
+    OFFLINE_HOLD = 3             // Hold last frame indefinitely
+};
+
+// Chase step structure (stored in NVS)
+struct ChaseStep {
+    uint8_t channels[LOOP_BUFFER_CHANNELS];  // Channel values for this step
+    uint16_t fadeMs;                          // Fade time to this step
+    uint16_t holdMs;                          // Hold time at this step
+};
+
+// Chase definition
+struct ChaseDefinition {
+    uint8_t stepCount;                        // Number of steps (0 = no chase stored)
+    uint8_t loopCount;                        // 0 = infinite loop
+    ChaseStep steps[MAX_CHASE_STEPS];
+};
+
+// DMX Ring Buffer for loop playback
+struct LoopBuffer {
+    uint8_t frames[LOOP_BUFFER_FRAMES][LOOP_BUFFER_CHANNELS];
+    uint8_t writeIndex;                       // Next frame to write
+    uint8_t frameCount;                       // Frames currently in buffer
+    uint8_t readIndex;                        // Current playback position
+    bool recording;                           // Whether we're recording
+    bool hasData;                             // Whether buffer has valid data
 };
 
 // ═══════════════════════════════════════════════════════════════════
@@ -104,7 +152,22 @@ unsigned long lastSenderChangeLog = 0;
 Preferences preferences;
 WiFiUDP configUdp;
 WiFiUDP discoveryUdp;
-ESPAsyncE131 e131(1);  // Single universe buffer
+WiFiUDP udpjsonDmxUdp;  // Port 6455 for UDPJSON DMX commands
+ESPAsyncE131 e131(1);  // Single universe buffer (legacy, kept for compatibility)
+
+// ═══════════════════════════════════════════════════════════════════
+// FADE ENGINE - Per-channel non-blocking fades
+// ═══════════════════════════════════════════════════════════════════
+struct ChannelFade {
+    uint8_t startValue;
+    uint8_t targetValue;
+    unsigned long startTime;
+    unsigned long durationMs;
+    bool active;
+};
+
+ChannelFade channelFades[513];  // 1-indexed (channel 1 = index 1)
+uint32_t udpjsonPacketsReceived = 0;  // Stats for UDPJSON
 
 // DMX buffers - decoupled receive from output with slice assembly
 uint8_t dmxIn[DMX_PACKET_SIZE] = {0};   // Incoming sACN data (full 512 channels)
@@ -121,6 +184,16 @@ int sourceUniverse = 0;       // sACN universe to listen on (0 = not configured)
 int sliceStart = 1;           // First channel of slice (1-512)
 int sliceEnd = 512;           // Last channel of slice (1-512)
 SliceMode sliceMode = SLICE_ZERO_OUTSIDE;  // How to handle channels outside slice
+
+// Offline playback state
+OfflineMode offlineMode = OFFLINE_LOOP;     // Default: loop last frames when offline
+LoopBuffer loopBuffer;                       // Ring buffer for loop playback
+ChaseDefinition storedChase;                 // Chase definition from NVS
+bool isOffline = false;                      // Currently in offline playback mode
+unsigned long offlineStartTime = 0;          // When offline mode started
+uint8_t chaseCurrentStep = 0;                // Current step in chase playback
+unsigned long chaseStepStartTime = 0;        // When current step started
+bool chaseFading = false;                    // Currently fading between steps
 
 // Stats - counters for observability
 uint32_t sacnPacketsReceived = 0;
@@ -149,12 +222,26 @@ void assembleOutputFrame();
 void outputDmxFrame();
 void updateOLED();
 void handleConfigCommand(const String& json);
+void handleUdpjsonDmxCommand(const String& json, IPAddress senderIP);
 void sendHeartbeat();
 void sendRegistration();
+void sendPong(IPAddress senderIP, int senderPort);
 void loadConfig();
 void saveConfig();
 void logStatus();
 void processSacnPacket(e131_packet_t* packet);
+void tickFades();
+void initFadeEngine();
+
+// Offline playback functions
+void initOfflinePlayback();
+void recordFrame();
+void startOfflineMode();
+void stopOfflineMode();
+void playOfflineFrame();
+void loadStoredChase();
+void saveStoredChase();
+void handleChaseCommand(JsonDocument& doc);
 
 // ═══════════════════════════════════════════════════════════════════
 // CONFIGURATION STORAGE
@@ -220,8 +307,243 @@ void saveConfig() {
     preferences.putInt("slice_end", sliceEnd);
     preferences.putInt("slice_mode", (int)sliceMode);
     preferences.putString("name", nodeName);
+    preferences.putInt("offline_mode", (int)offlineMode);
     preferences.end();
     Serial.println("Config saved to NVS");
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// OFFLINE PLAYBACK - Loop Buffer & Chase Storage
+// ═══════════════════════════════════════════════════════════════════
+
+void initOfflinePlayback() {
+    // Initialize loop buffer
+    memset(&loopBuffer, 0, sizeof(loopBuffer));
+    loopBuffer.recording = true;
+    loopBuffer.hasData = false;
+
+    // Initialize chase storage
+    memset(&storedChase, 0, sizeof(storedChase));
+
+    // Load offline mode preference
+    preferences.begin("aether", true);
+    offlineMode = (OfflineMode)preferences.getInt("offline_mode", OFFLINE_LOOP);
+    preferences.end();
+
+    // Load stored chase from NVS
+    loadStoredChase();
+
+    Serial.printf("Offline playback: mode=%d, chase_steps=%d\n",
+                  offlineMode, storedChase.stepCount);
+}
+
+void loadStoredChase() {
+    preferences.begin("chase", true);
+
+    storedChase.stepCount = preferences.getUChar("step_count", 0);
+    storedChase.loopCount = preferences.getUChar("loop_count", 0);
+
+    if (storedChase.stepCount > 0 && storedChase.stepCount <= MAX_CHASE_STEPS) {
+        // Load each step
+        for (int i = 0; i < storedChase.stepCount; i++) {
+            char key[16];
+
+            // Load fade/hold times
+            snprintf(key, sizeof(key), "s%d_fade", i);
+            storedChase.steps[i].fadeMs = preferences.getUShort(key, 500);
+
+            snprintf(key, sizeof(key), "s%d_hold", i);
+            storedChase.steps[i].holdMs = preferences.getUShort(key, 1000);
+
+            // Load channel data (stored as blob)
+            snprintf(key, sizeof(key), "s%d_ch", i);
+            size_t len = preferences.getBytesLength(key);
+            if (len > 0 && len <= LOOP_BUFFER_CHANNELS) {
+                preferences.getBytes(key, storedChase.steps[i].channels, len);
+            }
+        }
+        Serial.printf("Loaded chase: %d steps\n", storedChase.stepCount);
+    }
+
+    preferences.end();
+}
+
+void saveStoredChase() {
+    preferences.begin("chase", false);
+
+    preferences.putUChar("step_count", storedChase.stepCount);
+    preferences.putUChar("loop_count", storedChase.loopCount);
+
+    for (int i = 0; i < storedChase.stepCount && i < MAX_CHASE_STEPS; i++) {
+        char key[16];
+
+        snprintf(key, sizeof(key), "s%d_fade", i);
+        preferences.putUShort(key, storedChase.steps[i].fadeMs);
+
+        snprintf(key, sizeof(key), "s%d_hold", i);
+        preferences.putUShort(key, storedChase.steps[i].holdMs);
+
+        snprintf(key, sizeof(key), "s%d_ch", i);
+        preferences.putBytes(key, storedChase.steps[i].channels, LOOP_BUFFER_CHANNELS);
+    }
+
+    preferences.end();
+    Serial.printf("Saved chase: %d steps\n", storedChase.stepCount);
+}
+
+void recordFrame() {
+    // Record current DMX input to loop buffer (only first N channels)
+    if (!loopBuffer.recording) return;
+
+    // Copy first LOOP_BUFFER_CHANNELS from dmxIn to buffer
+    memcpy(loopBuffer.frames[loopBuffer.writeIndex], dmxIn + 1, LOOP_BUFFER_CHANNELS);
+
+    // Advance write pointer
+    loopBuffer.writeIndex = (loopBuffer.writeIndex + 1) % LOOP_BUFFER_FRAMES;
+
+    // Track how many frames we have
+    if (loopBuffer.frameCount < LOOP_BUFFER_FRAMES) {
+        loopBuffer.frameCount++;
+    }
+
+    loopBuffer.hasData = true;
+}
+
+void startOfflineMode() {
+    if (isOffline) return;
+
+    isOffline = true;
+    offlineStartTime = millis();
+    loopBuffer.recording = false;  // Stop recording, start playback
+    loopBuffer.readIndex = 0;      // Start from beginning of buffer
+
+    // Reset chase state
+    chaseCurrentStep = 0;
+    chaseStepStartTime = millis();
+    chaseFading = true;
+
+    const char* modeStr = "UNKNOWN";
+    switch (offlineMode) {
+        case OFFLINE_NONE: modeStr = "FADE-TO-BLACK"; break;
+        case OFFLINE_LOOP: modeStr = "LOOP"; break;
+        case OFFLINE_CHASE: modeStr = "CHASE"; break;
+        case OFFLINE_HOLD: modeStr = "HOLD"; break;
+    }
+
+    Serial.println("═══════════════════════════════════════════════════");
+    Serial.printf("  OFFLINE MODE: %s\n", modeStr);
+    if (offlineMode == OFFLINE_LOOP) {
+        Serial.printf("  Buffer: %d frames (~%.1fs)\n",
+                      loopBuffer.frameCount,
+                      loopBuffer.frameCount / (float)DMX_OUTPUT_FPS);
+    } else if (offlineMode == OFFLINE_CHASE && storedChase.stepCount > 0) {
+        Serial.printf("  Chase: %d steps\n", storedChase.stepCount);
+    }
+    Serial.println("═══════════════════════════════════════════════════");
+}
+
+void stopOfflineMode() {
+    if (!isOffline) return;
+
+    isOffline = false;
+    loopBuffer.recording = true;  // Resume recording
+
+    unsigned long offlineDuration = millis() - offlineStartTime;
+    Serial.printf("ONLINE: Back after %lums offline\n", offlineDuration);
+}
+
+void playOfflineFrame() {
+    if (!isOffline) return;
+
+    unsigned long now = millis();
+
+    switch (offlineMode) {
+        case OFFLINE_NONE:
+            // Fade to black (already handled in main loop)
+            break;
+
+        case OFFLINE_HOLD:
+            // Just keep last frame - do nothing, dmxIn already has it
+            break;
+
+        case OFFLINE_LOOP:
+            if (loopBuffer.hasData && loopBuffer.frameCount > 0) {
+                // Copy frame from buffer to dmxIn
+                memcpy(dmxIn + 1, loopBuffer.frames[loopBuffer.readIndex], LOOP_BUFFER_CHANNELS);
+
+                // Advance read pointer (loop around)
+                loopBuffer.readIndex = (loopBuffer.readIndex + 1) % loopBuffer.frameCount;
+            }
+            break;
+
+        case OFFLINE_CHASE:
+            if (storedChase.stepCount > 0) {
+                ChaseStep* currentStep = &storedChase.steps[chaseCurrentStep];
+                ChaseStep* nextStep = &storedChase.steps[(chaseCurrentStep + 1) % storedChase.stepCount];
+
+                unsigned long stepElapsed = now - chaseStepStartTime;
+                unsigned long totalStepTime = currentStep->fadeMs + currentStep->holdMs;
+
+                if (chaseFading && stepElapsed < currentStep->fadeMs) {
+                    // Fading to current step
+                    float progress = stepElapsed / (float)currentStep->fadeMs;
+                    uint8_t prevStep = (chaseCurrentStep == 0) ? storedChase.stepCount - 1 : chaseCurrentStep - 1;
+
+                    for (int i = 0; i < LOOP_BUFFER_CHANNELS; i++) {
+                        uint8_t from = storedChase.steps[prevStep].channels[i];
+                        uint8_t to = currentStep->channels[i];
+                        dmxIn[i + 1] = from + (to - from) * progress;
+                    }
+                } else if (stepElapsed < totalStepTime) {
+                    // Holding at current step
+                    chaseFading = false;
+                    memcpy(dmxIn + 1, currentStep->channels, LOOP_BUFFER_CHANNELS);
+                } else {
+                    // Move to next step
+                    chaseCurrentStep = (chaseCurrentStep + 1) % storedChase.stepCount;
+                    chaseStepStartTime = now;
+                    chaseFading = true;
+                }
+            }
+            break;
+    }
+}
+
+void handleChaseCommand(JsonDocument& doc) {
+    // Handle chase storage command from Pi
+    // Format: {"cmd":"store_chase","steps":[{"channels":[...],"fade_ms":500,"hold_ms":1000},...]}
+
+    JsonArray steps = doc["steps"].as<JsonArray>();
+    if (!steps) {
+        Serial.println("Chase: No steps array");
+        return;
+    }
+
+    storedChase.stepCount = 0;
+    storedChase.loopCount = doc["loop_count"] | 0;  // 0 = infinite
+
+    for (JsonObject step : steps) {
+        if (storedChase.stepCount >= MAX_CHASE_STEPS) break;
+
+        ChaseStep* s = &storedChase.steps[storedChase.stepCount];
+        s->fadeMs = step["fade_ms"] | 500;
+        s->holdMs = step["hold_ms"] | 1000;
+
+        // Get channel values
+        JsonArray channels = step["channels"].as<JsonArray>();
+        if (channels) {
+            int i = 0;
+            for (JsonVariant ch : channels) {
+                if (i >= LOOP_BUFFER_CHANNELS) break;
+                s->channels[i++] = ch.as<uint8_t>();
+            }
+        }
+
+        storedChase.stepCount++;
+    }
+
+    saveStoredChase();
+    Serial.printf("Chase stored: %d steps\n", storedChase.stepCount);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -601,6 +923,253 @@ void handleConfigCommand(const String& jsonStr) {
         // Re-register with Pi to show as unpaired
         sendRegistration();
     }
+    // Store chase definition for offline playback
+    else if (strcmp(cmd, "store_chase") == 0) {
+        handleChaseCommand(doc);
+    }
+    // Set offline mode
+    else if (strcmp(cmd, "set_offline_mode") == 0) {
+        const char* mode = doc["mode"];
+        if (mode) {
+            if (strcmp(mode, "none") == 0) offlineMode = OFFLINE_NONE;
+            else if (strcmp(mode, "loop") == 0) offlineMode = OFFLINE_LOOP;
+            else if (strcmp(mode, "chase") == 0) offlineMode = OFFLINE_CHASE;
+            else if (strcmp(mode, "hold") == 0) offlineMode = OFFLINE_HOLD;
+
+            saveConfig();
+            Serial.printf("Offline mode set to: %s\n", mode);
+        }
+    }
+    // Get offline status
+    else if (strcmp(cmd, "offline_status") == 0) {
+        const char* modeStr = "unknown";
+        switch (offlineMode) {
+            case OFFLINE_NONE: modeStr = "none"; break;
+            case OFFLINE_LOOP: modeStr = "loop"; break;
+            case OFFLINE_CHASE: modeStr = "chase"; break;
+            case OFFLINE_HOLD: modeStr = "hold"; break;
+        }
+        Serial.printf("Offline: mode=%s, buffer=%d frames, chase=%d steps, active=%s\n",
+                      modeStr, loopBuffer.frameCount, storedChase.stepCount,
+                      isOffline ? "YES" : "NO");
+    }
+    // ═══════════════════════════════════════════════════════════════════
+    // DIRECT DMX DATA VIA UDP JSON (Alternative to sACN - more reliable on WiFi)
+    // Format: {"cmd":"dmx","ch":[255,128,64,...]} - up to 512 channels
+    // This bypasses sACN entirely for networks where sACN has issues
+    // ═══════════════════════════════════════════════════════════════════
+    else if (strcmp(cmd, "dmx") == 0) {
+        JsonArray channels = doc["ch"].as<JsonArray>();
+        if (channels) {
+            int i = 1;  // DMX channels start at 1
+            for (JsonVariant ch : channels) {
+                if (i > 512) break;
+                dmxIn[i++] = ch.as<uint8_t>();
+            }
+            dmxDirty = true;
+            lastSacnReceived = millis();  // Treat as sACN for timeout purposes
+
+            // If we were offline, come back online
+            if (isOffline) {
+                stopOfflineMode();
+            }
+
+            // Record frame for offline playback
+            recordFrame();
+        }
+    }
+    // Full frame DMX data with start channel offset
+    // Format: {"cmd":"dmx_frame","start":1,"ch":[255,128,64,...]}
+    else if (strcmp(cmd, "dmx_frame") == 0) {
+        int startCh = doc["start"] | 1;
+        if (startCh < 1) startCh = 1;
+        if (startCh > 512) startCh = 512;
+
+        JsonArray channels = doc["ch"].as<JsonArray>();
+        if (channels) {
+            int i = startCh;
+            for (JsonVariant ch : channels) {
+                if (i > 512) break;
+                dmxIn[i++] = ch.as<uint8_t>();
+            }
+            dmxDirty = true;
+            lastSacnReceived = millis();
+
+            if (isOffline) {
+                stopOfflineMode();
+            }
+            recordFrame();
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// FADE ENGINE - Non-blocking per-channel fades
+// ═══════════════════════════════════════════════════════════════════
+void initFadeEngine() {
+    for (int i = 0; i < 513; i++) {
+        channelFades[i].active = false;
+    }
+}
+
+void tickFades() {
+    // Process active fades at ~50Hz (20ms interval)
+    static unsigned long lastTick = 0;
+    unsigned long now = millis();
+    if (now - lastTick < 20) return;
+    lastTick = now;
+
+    for (int ch = 1; ch <= 512; ch++) {
+        if (!channelFades[ch].active) continue;
+
+        unsigned long elapsed = now - channelFades[ch].startTime;
+        if (elapsed >= channelFades[ch].durationMs) {
+            // Fade complete
+            dmxIn[ch] = channelFades[ch].targetValue;
+            channelFades[ch].active = false;
+        } else {
+            // Interpolate (linear)
+            float progress = (float)elapsed / (float)channelFades[ch].durationMs;
+            int start = channelFades[ch].startValue;
+            int target = channelFades[ch].targetValue;
+            dmxIn[ch] = start + (int)((target - start) * progress);
+        }
+    }
+}
+
+void startChannelFade(int channel, uint8_t targetValue, unsigned long durationMs) {
+    if (channel < 1 || channel > 512) return;
+
+    channelFades[channel].startValue = dmxIn[channel];
+    channelFades[channel].targetValue = targetValue;
+    channelFades[channel].startTime = millis();
+    channelFades[channel].durationMs = durationMs;
+    channelFades[channel].active = true;
+}
+
+void cancelChannelFade(int channel) {
+    if (channel >= 1 && channel <= 512) {
+        channelFades[channel].active = false;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// UDPJSON DMX COMMAND HANDLER (Port 6455)
+// ═══════════════════════════════════════════════════════════════════
+void handleUdpjsonDmxCommand(const String& jsonStr, IPAddress senderIP) {
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, jsonStr);
+
+    if (error) {
+        static unsigned long lastErrorLog = 0;
+        if (millis() - lastErrorLog > 5000) {
+            Serial.printf("UDPJSON parse error: %s\n", error.c_str());
+            lastErrorLog = millis();
+        }
+        return;
+    }
+
+    const char* msgType = doc["type"];
+    if (!msgType) {
+        // Check for legacy "cmd" field for backward compatibility
+        const char* cmd = doc["cmd"];
+        if (cmd) {
+            // Handle legacy commands through the config handler
+            handleConfigCommand(jsonStr);
+            return;
+        }
+        return;
+    }
+
+    int universe = doc["universe"] | 0;
+
+    // Ignore messages for universes we don't serve
+    if (universe != 0 && universe != sourceUniverse) {
+        return;
+    }
+
+    udpjsonPacketsReceived++;
+    lastSacnReceived = millis();  // Treat as activity for timeout
+
+    // If we were offline, come back online
+    if (isOffline) {
+        stopOfflineMode();
+    }
+
+    // Handle message types
+    if (strcmp(msgType, "set") == 0) {
+        // Set channels immediately
+        JsonObject channels = doc["channels"].as<JsonObject>();
+        if (channels) {
+            int updated = 0;
+            for (JsonPair kv : channels) {
+                int ch = atoi(kv.key().c_str());
+                if (ch >= 1 && ch <= 512) {
+                    int val = kv.value().as<int>();
+                    dmxIn[ch] = constrain(val, 0, 255);
+                    cancelChannelFade(ch);  // Cancel any active fade
+                    updated++;
+                }
+            }
+            // Rate-limited logging
+            static unsigned long lastSetLog = 0;
+            if (millis() - lastSetLog > 1000) {
+                Serial.printf("UDPJSON: set U%d, %d channels\n", universe, updated);
+                lastSetLog = millis();
+            }
+        }
+        recordFrame();  // Record for offline playback
+
+    } else if (strcmp(msgType, "fade") == 0) {
+        // Start fade on channels
+        unsigned long durationMs = doc["duration_ms"] | 1000;
+        JsonObject channels = doc["channels"].as<JsonObject>();
+        if (channels) {
+            int started = 0;
+            for (JsonPair kv : channels) {
+                int ch = atoi(kv.key().c_str());
+                if (ch >= 1 && ch <= 512) {
+                    int targetVal = kv.value().as<int>();
+                    startChannelFade(ch, constrain(targetVal, 0, 255), durationMs);
+                    started++;
+                }
+            }
+            Serial.printf("UDPJSON: fade U%d, %d channels, %lums\n", universe, started, durationMs);
+        }
+
+    } else if (strcmp(msgType, "blackout") == 0) {
+        // Blackout all channels
+        Serial.printf("UDPJSON: blackout U%d\n", universe);
+        for (int ch = 1; ch <= 512; ch++) {
+            dmxIn[ch] = 0;
+            cancelChannelFade(ch);
+        }
+
+    } else if (strcmp(msgType, "ping") == 0) {
+        // Respond with pong
+        sendPong(senderIP, UDPJSON_DMX_PORT);
+    }
+}
+
+void sendPong(IPAddress senderIP, int senderPort) {
+    char json[512];
+    snprintf(json, sizeof(json),
+        "{\"type\":\"pong\",\"node_id\":\"%s\","
+        "\"universes\":[%d],\"slice_start\":%d,\"slice_end\":%d,"
+        "\"slice_mode\":\"%s\",\"version\":\"%s\","
+        "\"rssi\":%d,\"uptime_s\":%lu,\"dmx_tx_fps\":%d,"
+        "\"rx_udp_packets\":%lu}",
+        nodeId.c_str(), sourceUniverse,
+        sliceStart, sliceEnd,
+        sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through",
+        FIRMWARE_VERSION, WiFi.RSSI(), millis() / 1000,
+        DMX_OUTPUT_FPS, udpjsonPacketsReceived);
+
+    udpjsonDmxUdp.beginPacket(senderIP, senderPort);
+    udpjsonDmxUdp.print(json);
+    udpjsonDmxUdp.endPacket();
+
+    Serial.printf("UDPJSON: pong sent to %s\n", senderIP.toString().c_str());
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -651,15 +1220,15 @@ void sendHeartbeat() {
     char json[512];
     snprintf(json, sizeof(json),
         "{\"type\":\"heartbeat\",\"node_id\":\"%s\",\"rssi\":%d,"
-        "\"uptime\":%lu,\"sacn_pkts\":%lu,\"dmx_frames\":%lu,"
+        "\"uptime\":%lu,\"udpjson_pkts\":%lu,\"dmx_frames\":%lu,"
         "\"universe\":%d,\"slice_start\":%d,\"slice_end\":%d,"
-        "\"slice_mode\":\"%s\",\"transport\":\"sACN\","
-        "\"sender_cid\":\"%s\",\"sender_changes\":%lu}",
+        "\"slice_mode\":\"%s\",\"transport\":\"UDPJSON\","
+        "\"port\":%d}",
         nodeId.c_str(), WiFi.RSSI(), millis() / 1000,
-        sacnPacketsReceived, dmxFramesSent, sourceUniverse,
+        udpjsonPacketsReceived, dmxFramesSent, sourceUniverse,
         sliceStart, sliceEnd,
         sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through",
-        senderCid, senderChanges);
+        UDPJSON_DMX_PORT);
 
     discoveryUdp.beginPacket(CONTROLLER_IP, DISCOVERY_PORT);
     discoveryUdp.print(json);
@@ -766,25 +1335,40 @@ void updateOLED() {
     // Mode
     display.setTextSize(1);
     display.setCursor(60, 18);
-    display.print("sACN");
+    display.print("UDP");
 
     // Slice info (shows the channel range this node outputs)
     display.setCursor(60, 28);
     display.printf("%d-%d", sliceStart, sliceEnd);
 
-    // sACN status with sender indicator
+    // UDPJSON status with activity indicator
     display.setCursor(0, 40);
     unsigned long timeSinceSacn = millis() - lastSacnReceived;
     if (lastSacnReceived == 0) {
-        display.print("Waiting for sACN...");
+        display.print("Waiting for data...");
     } else if (timeSinceSacn < 1000) {
-        display.print("sACN: LIVE");
+        display.print("UDPJSON: LIVE");
         // Activity indicator
         display.fillCircle(120, 43, 3, SSD1306_WHITE);
+    } else if (isOffline) {
+        // Show offline mode
+        switch (offlineMode) {
+            case OFFLINE_LOOP:
+                display.print("OFFLINE: LOOP");
+                break;
+            case OFFLINE_CHASE:
+                display.print("OFFLINE: CHASE");
+                break;
+            case OFFLINE_HOLD:
+                display.print("OFFLINE: HOLD");
+                break;
+            default:
+                display.print("OFFLINE: FADE");
+        }
     } else if (timeSinceSacn < SACN_TIMEOUT_MS) {
-        display.printf("sACN: %lus ago", timeSinceSacn / 1000);
+        display.printf("UDP: %lus ago", timeSinceSacn / 1000);
     } else {
-        display.print("sACN: TIMEOUT");
+        display.print("UDP: TIMEOUT");
     }
 
     // Stats row with sender changes if any
@@ -860,13 +1444,13 @@ void setup() {
     // Boot banner
     Serial.println();
     Serial.println("═══════════════════════════════════════════════════");
-    Serial.println("  AETHER Pulse - sACN/E1.31 DMX Node");
+    Serial.println("  AETHER Pulse - UDPJSON DMX Node");
     Serial.println("═══════════════════════════════════════════════════");
-    Serial.printf("  Firmware:  pulse-sacn v%s\n", FIRMWARE_VERSION);
+    Serial.printf("  Firmware:  pulse-udpjson v%s\n", FIRMWARE_VERSION);
     Serial.printf("  Node ID:   %s\n", nodeId.c_str());
-    Serial.printf("  Transport: sACN/E1.31 multicast\n");
+    Serial.printf("  Transport: UDPJSON on port %d\n", UDPJSON_DMX_PORT);
     Serial.printf("  Output:    %d fps (fixed rate)\n", DMX_OUTPUT_FPS);
-    Serial.printf("  Features:  channel-slice, multi-sender=last-wins\n");
+    Serial.printf("  Features:  channel-slice, fade-engine, offline-playback\n");
     Serial.println("═══════════════════════════════════════════════════");
     Serial.println();
 
@@ -876,16 +1460,23 @@ void setup() {
     // Load config from NVS
     loadConfig();
 
+    // Initialize offline playback system
+    initOfflinePlayback();
+
     // Connect to WiFi
     initWiFi();
+
+    // Initialize fade engine
+    initFadeEngine();
 
     if (WiFi.status() == WL_CONNECTED) {
         // Start UDP listeners
         configUdp.begin(CONFIG_PORT);
         discoveryUdp.begin(DISCOVERY_PORT);
-        Serial.printf("UDP: Config=%d, Discovery=%d\n", CONFIG_PORT, DISCOVERY_PORT);
+        udpjsonDmxUdp.begin(UDPJSON_DMX_PORT);  // Port 6455 for UDPJSON DMX
+        Serial.printf("UDP: Config=%d, Discovery=%d, UDPJSON DMX=%d\n", CONFIG_PORT, DISCOVERY_PORT, UDPJSON_DMX_PORT);
 
-        // Initialize sACN (universe from config, not hardcoded)
+        // Initialize sACN (legacy, kept for backward compatibility)
         initSacn();
 
         // Enable OTA
@@ -928,30 +1519,64 @@ void loop() {
 
         // The library already filters by universe, so this packet matches sourceUniverse
         processSacnPacket(&packet);
+
+        // If we were offline, come back online
+        if (isOffline) {
+            stopOfflineMode();
+        }
+
+        // Record frame to loop buffer for offline playback
+        recordFrame();
     }
 
-    // Hold-last-frame timeout - fade to black after timeout with no sACN
+    // ─────────────────────────────────────────────────────────────────
+    // OFFLINE PLAYBACK - Switch to offline mode after timeout
+    // ─────────────────────────────────────────────────────────────────
     if (lastSacnReceived > 0 && (now - lastSacnReceived) > SACN_TIMEOUT_MS) {
-        // Gradual fade to black (simple linear fade) - fade input buffer
-        static unsigned long lastFadeStep = 0;
-        if (now - lastFadeStep > 50) {  // Fade step every 50ms
-            bool anyActive = false;
-            for (int i = 1; i <= 512; i++) {
-                if (dmxIn[i] > 0) {
-                    dmxIn[i] = (dmxIn[i] > 5) ? dmxIn[i] - 5 : 0;
-                    anyActive = true;
+        // Start offline mode if not already
+        if (!isOffline) {
+            startOfflineMode();
+        }
+
+        // Handle offline playback based on mode
+        if (offlineMode == OFFLINE_NONE) {
+            // Gradual fade to black (simple linear fade)
+            static unsigned long lastFadeStep = 0;
+            if (now - lastFadeStep > 50) {
+                bool anyActive = false;
+                for (int i = 1; i <= 512; i++) {
+                    if (dmxIn[i] > 0) {
+                        dmxIn[i] = (dmxIn[i] > 5) ? dmxIn[i] - 5 : 0;
+                        anyActive = true;
+                    }
+                }
+                lastFadeStep = now;
+                if (!anyActive) {
+                    lastSacnReceived = 0;
+                    Serial.println("sACN: Fade to black complete");
                 }
             }
-            lastFadeStep = now;
-            if (!anyActive) {
-                lastSacnReceived = 0;  // Reset so we stop fading
-                Serial.println("sACN: Fade to black complete");
-            }
+        } else {
+            // Loop or Chase playback
+            playOfflineFrame();
         }
     }
 
     // ─────────────────────────────────────────────────────────────────
-    // UDP CONFIG COMMANDS (not DMX data)
+    // UDPJSON DMX COMMANDS (Port 6455) - Primary DMX transport
+    // ─────────────────────────────────────────────────────────────────
+    int udpjsonPacketSize = udpjsonDmxUdp.parsePacket();
+    if (udpjsonPacketSize > 0) {
+        char buffer[1024];
+        int len = udpjsonDmxUdp.read(buffer, sizeof(buffer) - 1);
+        if (len > 0) {
+            buffer[len] = '\0';
+            handleUdpjsonDmxCommand(String(buffer), udpjsonDmxUdp.remoteIP());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // UDP CONFIG COMMANDS (Port 8888 - legacy config)
     // ─────────────────────────────────────────────────────────────────
     int packetSize = configUdp.parsePacket();
     if (packetSize > 0) {
@@ -962,6 +1587,11 @@ void loop() {
             handleConfigCommand(String(buffer));
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────
+    // FADE ENGINE TICK - Process non-blocking fades
+    // ─────────────────────────────────────────────────────────────────
+    tickFades();
 
     // ─────────────────────────────────────────────────────────────────
     // DMX OUTPUT @ FIXED RATE (decoupled from receive)
