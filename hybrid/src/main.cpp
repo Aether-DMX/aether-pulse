@@ -1567,7 +1567,7 @@ void loop() {
     // ─────────────────────────────────────────────────────────────────
     int udpjsonPacketSize = udpjsonDmxUdp.parsePacket();
     if (udpjsonPacketSize > 0) {
-        char buffer[1024];
+        char buffer[4096];  // Increased from 1024 to handle larger payloads
         int len = udpjsonDmxUdp.read(buffer, sizeof(buffer) - 1);
         if (len > 0) {
             buffer[len] = '\0';
@@ -1580,7 +1580,7 @@ void loop() {
     // ─────────────────────────────────────────────────────────────────
     int packetSize = configUdp.parsePacket();
     if (packetSize > 0) {
-        char buffer[512];
+        char buffer[2048];  // Increased from 512
         int len = configUdp.read(buffer, sizeof(buffer) - 1);
         if (len > 0) {
             buffer[len] = '\0';
