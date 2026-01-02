@@ -217,7 +217,7 @@ void initFadeEngine();
 void loadConfig();
 void saveConfig();
 
-void handleDmxPacket(char* buffer, int len, IPAddress senderIP);
+void handleDmxPacket(char* buffer, int len, IPAddress senderIP, int senderPort);
 void handleConfigPacket(char* buffer, int len);
 
 void tickFades();
@@ -232,8 +232,8 @@ void logStatus();
 
 bool validatePacketSize(int size);
 bool validateSequence(uint32_t seq);
-bool parseV1Packet(JsonDocument& doc);
-bool parseV2Packet(JsonDocument& doc);
+bool parseV1Packet(JsonDocument& doc, IPAddress senderIP, int senderPort);
+bool parseV2Packet(JsonDocument& doc, IPAddress senderIP, int senderPort);
 
 // ═══════════════════════════════════════════════════════════════════
 // CONFIGURATION STORAGE
@@ -355,7 +355,7 @@ bool validateSequence(uint32_t seq) {
 // ═══════════════════════════════════════════════════════════════════
 // PROTOCOL PARSER - V1 Legacy Format
 // ═══════════════════════════════════════════════════════════════════
-bool parseV1Packet(JsonDocument& doc, IPAddress senderIP) {
+bool parseV1Packet(JsonDocument& doc, IPAddress senderIP, int senderPort) {
     telemetry.rx_v1_legacy++;
 
     const char* msgType = doc["type"];
@@ -403,7 +403,7 @@ bool parseV1Packet(JsonDocument& doc, IPAddress senderIP) {
         return true;
     }
     else if (strcmp(msgType, "ping") == 0) {
-        sendPong(senderIP, UDPJSON_DMX_PORT, 0);
+        sendPong(senderIP, senderPort, 0);
         return true;
     }
 
@@ -413,7 +413,7 @@ bool parseV1Packet(JsonDocument& doc, IPAddress senderIP) {
 // ═══════════════════════════════════════════════════════════════════
 // PROTOCOL PARSER - V2 Compact Format
 // ═══════════════════════════════════════════════════════════════════
-bool parseV2Packet(JsonDocument& doc, IPAddress senderIP) {
+bool parseV2Packet(JsonDocument& doc, IPAddress senderIP, int senderPort) {
     telemetry.rx_v2++;
 
     const char* msgType = doc["type"];
@@ -540,7 +540,7 @@ bool parseV2Packet(JsonDocument& doc, IPAddress senderIP) {
         success = true;
     }
     else if (strcmp(msgType, "ping") == 0) {
-        sendPong(senderIP, UDPJSON_DMX_PORT, seq);
+        sendPong(senderIP, senderPort, seq);
         success = true;
     }
     else if (strcmp(msgType, "rdm") == 0) {
@@ -549,14 +549,14 @@ bool parseV2Packet(JsonDocument& doc, IPAddress senderIP) {
         snprintf(response, sizeof(response),
             "{\"v\":%d,\"type\":\"rdm_err\",\"seq\":%lu,\"err\":\"not_supported_yet\"}",
             PROTOCOL_VERSION, seq);
-        dmxUdp.beginPacket(senderIP, UDPJSON_DMX_PORT);
+        dmxUdp.beginPacket(senderIP, senderPort);
         dmxUdp.print(response);
         dmxUdp.endPacket();
         success = true;
     }
 
     if (wantsAck && seq > 0) {
-        sendAck(senderIP, UDPJSON_DMX_PORT, seq, success);
+        sendAck(senderIP, senderPort, seq, success);
     }
 
     return success;
@@ -565,7 +565,7 @@ bool parseV2Packet(JsonDocument& doc, IPAddress senderIP) {
 // ═══════════════════════════════════════════════════════════════════
 // PACKET HANDLER
 // ═══════════════════════════════════════════════════════════════════
-void handleDmxPacket(char* buffer, int len, IPAddress senderIP) {
+void handleDmxPacket(char* buffer, int len, IPAddress senderIP, int senderPort) {
     telemetry.rx_total++;
     telemetry.last_packet_time = millis();
     telemetry.is_stale = false;
@@ -594,9 +594,9 @@ void handleDmxPacket(char* buffer, int len, IPAddress senderIP) {
 
     bool success = false;
     if (version >= 2) {
-        success = parseV2Packet(doc, senderIP);
+        success = parseV2Packet(doc, senderIP, senderPort);
     } else {
-        success = parseV1Packet(doc, senderIP);
+        success = parseV1Packet(doc, senderIP, senderPort);
     }
 
     if (!success) {
@@ -777,7 +777,7 @@ void sendPong(IPAddress senderIP, int senderPort, uint32_t seq) {
     dmxUdp.endPacket();
     telemetry.tx_pong++;
 
-    Serial.printf("PONG sent to %s\n", senderIP.toString().c_str());
+    Serial.printf("PONG sent to %s:%d\n", senderIP.toString().c_str(), senderPort);
 }
 
 void sendAck(IPAddress senderIP, int senderPort, uint32_t seq, bool ok) {
@@ -1073,11 +1073,15 @@ void loop() {
     // ─────────────────────────────────────────────────────────────────
     int packetSize = dmxUdp.parsePacket();
     if (packetSize > 0) {
+        // Capture sender info BEFORE reading - remoteIP/remotePort only valid after parsePacket
+        IPAddress senderIP = dmxUdp.remoteIP();
+        int senderPort = dmxUdp.remotePort();
+
         static char buffer[MAX_JSON_BUFFER];
         int len = dmxUdp.read(buffer, sizeof(buffer) - 1);
         if (len > 0) {
             buffer[len] = '\0';
-            handleDmxPacket(buffer, len, dmxUdp.remoteIP());
+            handleDmxPacket(buffer, len, senderIP, senderPort);
         }
     }
 

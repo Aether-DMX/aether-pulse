@@ -1,16 +1,21 @@
 /**
- * AETHER Pulse - UDPJSON DMX Node v2.5.0
+ * AETHER Pulse - UDPJSON DMX Node v3.0.0
  *
- * Wireless DMX receiver using direct UDP JSON protocol.
+ * Wireless DMX receiver using direct UDP JSON protocol ONLY.
  * Receives DMX commands from AETHER Core on port 6455.
+ *
+ * Transport: UDP JSON (port 6455)
+ * - All 512 channels per universe
+ * - Fades handled locally by node
+ * - No sACN/E1.31 (removed for simplicity)
+ * - RDM-ready architecture (DMX output isolated from transport)
  *
  * Features:
  * - UDPJSON DMX protocol (set, fade, blackout, ping/pong)
- * - Channel slice output (multiple nodes can share a universe)
- * - RS485/DMX output at configurable fixed rate (default 40Hz)
- * - Hold-last-frame on signal loss with fade to black
- * - Non-blocking fade engine
- * - Periodic status logging for field debugging
+ * - Full 512 channel output per universe
+ * - RS485/DMX output at fixed 40Hz
+ * - Non-blocking per-channel fade engine
+ * - Periodic status logging
  * - OLED status display
  * - OTA firmware updates
  * - NVS configuration storage
@@ -21,13 +26,16 @@
  * - {"type":"blackout","universe":2,"ts":...}
  * - {"type":"ping","ts":...} -> responds with pong
  *
+ * Future RDM support:
+ * - {"type":"rdm","command":...} -> will be handled when implemented
+ *
  * Build: pio run
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
-#include <ESPAsyncE131.h>
+// NOTE: ESPAsyncE131 removed - using UDPJSON only
 #include <esp_dmx.h>
 #include <ArduinoOTA.h>
 #include <Wire.h>
@@ -39,7 +47,7 @@
 // ═══════════════════════════════════════════════════════════════════
 // VERSION
 // ═══════════════════════════════════════════════════════════════════
-#define FIRMWARE_VERSION "2.5.0"
+#define FIRMWARE_VERSION "3.0.0"
 
 // ═══════════════════════════════════════════════════════════════════
 // PIN DEFINITIONS
@@ -70,8 +78,7 @@ const char* CONTROLLER_IP = "192.168.50.1";  // Pi's IP on AetherDMX network
 #define DMX_PACKET_SIZE 513
 #define DMX_OUTPUT_FPS 40               // Fixed output rate (25ms interval)
 #define DMX_OUTPUT_INTERVAL_MS (1000 / DMX_OUTPUT_FPS)
-#define SACN_TIMEOUT_MS 3000            // Switch to offline mode after 3s
-#define SACN_STALE_LOG_INTERVAL_MS 2000 // Rate-limit stale universe logs
+#define UDP_TIMEOUT_MS 3000             // Switch to offline mode after 3s no data
 #define STATUS_LOG_INTERVAL_MS 10000    // Status report every 10s
 
 // ═══════════════════════════════════════════════════════════════════
@@ -133,11 +140,10 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 bool oledPresent = false;
 
 // ═══════════════════════════════════════════════════════════════════
-// sACN SENDER TRACKING (multi-sender policy: last-wins)
+// UDP SENDER TRACKING
 // ═══════════════════════════════════════════════════════════════════
 struct SenderInfo {
     IPAddress ip;
-    uint8_t cid[16];          // sACN CID (Component Identifier)
     unsigned long lastSeen;
     uint32_t packetCount;
     bool valid;
@@ -152,8 +158,7 @@ unsigned long lastSenderChangeLog = 0;
 Preferences preferences;
 WiFiUDP configUdp;
 WiFiUDP discoveryUdp;
-WiFiUDP udpjsonDmxUdp;  // Port 6455 for UDPJSON DMX commands
-ESPAsyncE131 e131(1);  // Single universe buffer (legacy, kept for compatibility)
+WiFiUDP udpjsonDmxUdp;  // Port 6455 for UDPJSON DMX commands (SSOT transport)
 
 // ═══════════════════════════════════════════════════════════════════
 // FADE ENGINE - Per-channel non-blocking fades
@@ -169,9 +174,9 @@ struct ChannelFade {
 ChannelFade channelFades[513];  // 1-indexed (channel 1 = index 1)
 uint32_t udpjsonPacketsReceived = 0;  // Stats for UDPJSON
 
-// DMX buffers - decoupled receive from output with slice assembly
-uint8_t dmxIn[DMX_PACKET_SIZE] = {0};   // Incoming sACN data (full 512 channels)
-uint8_t dmxOut[DMX_PACKET_SIZE] = {0};  // Output frame (slice-assembled)
+// DMX buffers - decoupled receive from output
+uint8_t dmxIn[DMX_PACKET_SIZE] = {0};   // Incoming UDPJSON data (full 512 channels)
+uint8_t dmxOut[DMX_PACKET_SIZE] = {0};  // Output frame for RS-485/DMX
 volatile bool dmxDirty = false;          // Flag for new data received
 
 String nodeId = "";
@@ -180,7 +185,7 @@ String deviceLabel = "";  // Always shows PULSE-XXXX for hardware identification
 
 // Configuration (stored in NVS)
 bool isPaired = false;        // Whether node has been configured/paired
-int sourceUniverse = 0;       // sACN universe to listen on (0 = not configured)
+int sourceUniverse = 0;       // Universe to receive data for (0 = not configured)
 int sliceStart = 1;           // First channel of slice (1-512)
 int sliceEnd = 512;           // Last channel of slice (1-512)
 SliceMode sliceMode = SLICE_ZERO_OUTSIDE;  // How to handle channels outside slice
@@ -196,8 +201,8 @@ unsigned long chaseStepStartTime = 0;        // When current step started
 bool chaseFading = false;                    // Currently fading between steps
 
 // Stats - counters for observability
-uint32_t sacnPacketsReceived = 0;
-uint32_t sacnPacketsIgnored = 0;  // Packets for wrong universe (should be 0)
+uint32_t udpPacketsReceived = 0;
+uint32_t udpPacketsIgnored = 0;  // Packets for wrong universe
 uint32_t dmxFramesSent = 0;
 uint32_t configCommandsReceived = 0;
 uint32_t senderChanges = 0;
@@ -229,7 +234,6 @@ void sendPong(IPAddress senderIP, int senderPort);
 void loadConfig();
 void saveConfig();
 void logStatus();
-void processSacnPacket(e131_packet_t* packet);
 void tickFades();
 void initFadeEngine();
 
@@ -261,7 +265,7 @@ void loadConfig() {
         sourceUniverse = 0;
     }
 
-    // Validate universe range (sACN allows 1-63999, 0 = not configured)
+    // Validate universe range (DMX allows 1-63999, 0 = not configured)
     if (sourceUniverse != 0 && (sourceUniverse < 1 || sourceUniverse > 63999)) {
         Serial.printf("⚠️ Invalid universe %d, resetting to unpaired\n", sourceUniverse);
         sourceUniverse = 0;
@@ -578,30 +582,10 @@ void initWiFi() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// sACN/E1.31 RECEPTION
+// UNIVERSE CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════
-void initSacn() {
-    // Only start sACN if paired with a valid universe
-    if (!isPaired || sourceUniverse == 0) {
-        Serial.println("sACN: Not starting - waiting for pairing");
-        return;
-    }
-
-    // Universe parameter is used correctly - no hardcoding to 1
-    if (e131.begin(E131_MULTICAST, sourceUniverse, 1)) {
-        Serial.printf("sACN: Listening on Universe %d (multicast 239.255.0.%d)\n",
-                      sourceUniverse, sourceUniverse);
-    } else {
-        Serial.println("sACN: Init FAILED!");
-    }
-
-    // Reset sender tracking for new universe
-    currentSender.valid = false;
-    currentSender.packetCount = 0;
-}
-
 void changeUniverse(int newUniverse) {
-    // Validate universe range (1-63999 per sACN spec)
+    // Validate universe range (1-63999 per DMX spec)
     if (newUniverse < 1 || newUniverse > 63999) {
         Serial.printf("⚠️ Invalid universe %d (must be 1-63999)\n", newUniverse);
         return;
@@ -614,57 +598,12 @@ void changeUniverse(int newUniverse) {
     // Setting a universe means we're now paired
     isPaired = true;
 
-    // Reinitialize sACN with new universe
-    initSacn();
+    // Reset sender tracking
+    currentSender.valid = false;
+    currentSender.packetCount = 0;
+
     saveConfig();
-}
-
-void processSacnPacket(e131_packet_t* packet) {
-    unsigned long now = millis();
-
-    // Check for sender change (multi-sender detection)
-    bool senderChanged = false;
-    if (!currentSender.valid) {
-        // First sender
-        senderChanged = true;
-        currentSender.valid = true;
-        memcpy(currentSender.cid, &packet->cid, 16);
-        currentSender.packetCount = 0;
-        Serial.printf("sACN: First sender detected for Universe %d\n", sourceUniverse);
-    } else {
-        // Check if CID changed
-        if (memcmp(currentSender.cid, &packet->cid, 16) != 0) {
-            senderChanged = true;
-            senderChanges++;
-
-            // Rate-limit sender change logs
-            if (now - lastSenderChangeLog > 5000) {
-                char oldCid[9], newCid[9];
-                snprintf(oldCid, sizeof(oldCid), "%02X%02X%02X%02X",
-                    currentSender.cid[0], currentSender.cid[1],
-                    currentSender.cid[2], currentSender.cid[3]);
-                snprintf(newCid, sizeof(newCid), "%02X%02X%02X%02X",
-                    packet->cid[0], packet->cid[1],
-                    packet->cid[2], packet->cid[3]);
-                Serial.printf("⚠️ Universe %d sender changed: %s -> %s (policy=last-wins)\n",
-                    sourceUniverse, oldCid, newCid);
-                lastSenderChangeLog = now;
-            }
-
-            memcpy(currentSender.cid, &packet->cid, 16);
-        }
-    }
-
-    currentSender.lastSeen = now;
-    currentSender.packetCount++;
-
-    // Copy DMX data to input buffer (property_values[0] is start code, channels at 1-512)
-    // This decouples receive from output - we just update the input buffer
-    memcpy(dmxIn + 1, packet->property_values + 1, 512);
-    dmxDirty = true;
-
-    sacnPacketsReceived++;
-    lastSacnReceived = now;
+    Serial.printf("✓ Now listening for Universe %d via UDPJSON\n", sourceUniverse);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -728,21 +667,19 @@ void logStatus() {
         lastFpsCalc = now;
     }
 
-    // Time since last sACN
-    unsigned long timeSinceSacn = lastSacnReceived > 0 ? (now - lastSacnReceived) : 0;
-    const char* sacnStatus = "NONE";
+    // Time since last UDP data (status only, no failsafe)
+    unsigned long timeSinceUdp = lastSacnReceived > 0 ? (now - lastSacnReceived) : 0;
+    const char* udpStatus = "NONE";
     if (lastSacnReceived > 0) {
-        if (timeSinceSacn < 1000) sacnStatus = "LIVE";
-        else if (timeSinceSacn < SACN_TIMEOUT_MS) sacnStatus = "STALE";
-        else sacnStatus = "TIMEOUT";
+        if (timeSinceUdp < 1000) udpStatus = "LIVE";
+        else if (timeSinceUdp < UDP_TIMEOUT_MS) udpStatus = "STALE";
+        else udpStatus = "IDLE";  // Just status, no failsafe action
     }
 
     // Sender info
     char senderStr[20] = "none";
     if (currentSender.valid) {
-        snprintf(senderStr, sizeof(senderStr), "%02X%02X..%02X%02X",
-            currentSender.cid[0], currentSender.cid[1],
-            currentSender.cid[14], currentSender.cid[15]);
+        snprintf(senderStr, sizeof(senderStr), "%s", currentSender.ip.toString().c_str());
     }
 
     // Slice boundary preview
@@ -756,9 +693,9 @@ void logStatus() {
     Serial.println("───────────────────────────────────────────────");
     Serial.printf("  Slice:    %d-%d (%s)\n", sliceStart, sliceEnd,
         sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through");
-    Serial.printf("  sACN:     %s (last %lums ago)\n", sacnStatus, timeSinceSacn);
-    Serial.printf("  Sender:   %s (changes: %lu)\n", senderStr, senderChanges);
-    Serial.printf("  Packets:  RX=%lu, ignored=%lu\n", sacnPacketsReceived, sacnPacketsIgnored);
+    Serial.printf("  UDP:      %s (last %lums ago)\n", udpStatus, timeSinceUdp);
+    Serial.printf("  Sender:   %s\n", senderStr);
+    Serial.printf("  Packets:  UDPJSON=%lu\n", udpjsonPacketsReceived);
     Serial.printf("  Output:   TX=%lu, fps=%.1f (target %d)\n", dmxFramesSent, actualFps, DMX_OUTPUT_FPS);
     Serial.printf("  WiFi:     %s, RSSI=%d dBm\n",
         WiFi.status() == WL_CONNECTED ? "OK" : "DISCONNECTED", WiFi.RSSI());
@@ -913,9 +850,7 @@ void handleConfigCommand(const String& jsonStr) {
         preferences.clear();
         preferences.end();
 
-        // Note: ESPAsyncE131 doesn't have end() method
-        // The node will stop processing sACN since sourceUniverse is now 0
-        // On reboot, initSacn() won't start since isPaired is false
+        // On reboot, node won't process UDPJSON since isPaired is false
 
         Serial.println("Config cleared. Node waiting for pairing.");
         Serial.println("Universe: NONE (waiting for config)");
@@ -954,9 +889,9 @@ void handleConfigCommand(const String& jsonStr) {
                       isOffline ? "YES" : "NO");
     }
     // ═══════════════════════════════════════════════════════════════════
-    // DIRECT DMX DATA VIA UDP JSON (Alternative to sACN - more reliable on WiFi)
+    // LEGACY DMX DATA VIA UDP JSON (array format)
     // Format: {"cmd":"dmx","ch":[255,128,64,...]} - up to 512 channels
-    // This bypasses sACN entirely for networks where sACN has issues
+    // Kept for backward compatibility - new code uses UDPJSON on port 6455
     // ═══════════════════════════════════════════════════════════════════
     else if (strcmp(cmd, "dmx") == 0) {
         JsonArray channels = doc["ch"].as<JsonArray>();
@@ -967,7 +902,7 @@ void handleConfigCommand(const String& jsonStr) {
                 dmxIn[i++] = ch.as<uint8_t>();
             }
             dmxDirty = true;
-            lastSacnReceived = millis();  // Treat as sACN for timeout purposes
+            lastSacnReceived = millis();  // Track last packet for status only
 
             // If we were offline, come back online
             if (isOffline) {
@@ -1186,9 +1121,8 @@ void sendRegistration() {
         "\"is_paired\":%s,\"waiting_for_config\":%s,"
         "\"slice_start\":%d,\"slice_end\":%d,\"slice_mode\":\"%s\","
         "\"startChannel\":%d,\"channelCount\":%d,"
-        "\"firmware\":\"pulse-sacn\",\"version\":\"%s\","
-        "\"transport\":\"sACN\",\"rssi\":%d,\"uptime\":%lu,"
-        "\"sender_policy\":\"last-wins\"}",
+        "\"firmware\":\"pulse-udpjson\",\"version\":\"%s\","
+        "\"transport\":\"UDPJSON\",\"rssi\":%d,\"uptime\":%lu}",
         nodeId.c_str(), nodeName.c_str(),
         WiFi.macAddress().c_str(), WiFi.localIP().toString().c_str(),
         sourceUniverse,
@@ -1208,13 +1142,9 @@ void sendHeartbeat() {
     if (WiFi.status() != WL_CONNECTED) return;
 
     // Include sender info in heartbeat for Pi-side observability
-    char senderCid[17] = "none";
+    char senderStr[20] = "none";
     if (currentSender.valid) {
-        snprintf(senderCid, sizeof(senderCid), "%02X%02X%02X%02X%02X%02X%02X%02X",
-            currentSender.cid[0], currentSender.cid[1],
-            currentSender.cid[2], currentSender.cid[3],
-            currentSender.cid[4], currentSender.cid[5],
-            currentSender.cid[6], currentSender.cid[7]);
+        snprintf(senderStr, sizeof(senderStr), "%s", currentSender.ip.toString().c_str());
     }
 
     char json[512];
@@ -1223,12 +1153,12 @@ void sendHeartbeat() {
         "\"uptime\":%lu,\"udpjson_pkts\":%lu,\"dmx_frames\":%lu,"
         "\"universe\":%d,\"slice_start\":%d,\"slice_end\":%d,"
         "\"slice_mode\":\"%s\",\"transport\":\"UDPJSON\","
-        "\"port\":%d}",
+        "\"sender\":\"%s\",\"port\":%d}",
         nodeId.c_str(), WiFi.RSSI(), millis() / 1000,
         udpjsonPacketsReceived, dmxFramesSent, sourceUniverse,
         sliceStart, sliceEnd,
         sliceMode == SLICE_ZERO_OUTSIDE ? "zero_outside" : "pass_through",
-        UDPJSON_DMX_PORT);
+        senderStr, UDPJSON_DMX_PORT);
 
     discoveryUdp.beginPacket(CONTROLLER_IP, DISCOVERY_PORT);
     discoveryUdp.print(json);
@@ -1365,19 +1295,15 @@ void updateOLED() {
             default:
                 display.print("OFFLINE: FADE");
         }
-    } else if (timeSinceSacn < SACN_TIMEOUT_MS) {
+    } else if (timeSinceSacn < UDP_TIMEOUT_MS) {
         display.printf("UDP: %lus ago", timeSinceSacn / 1000);
     } else {
-        display.print("UDP: TIMEOUT");
+        display.print("UDP: IDLE");  // Just status, output continues
     }
 
-    // Stats row with sender changes if any
+    // Stats row
     display.setCursor(0, 52);
-    if (senderChanges > 0) {
-        display.printf("RX:%lu S:%lu", sacnPacketsReceived % 100000, senderChanges);
-    } else {
-        display.printf("RX:%lu TX:%lu", sacnPacketsReceived % 100000, dmxFramesSent % 100000);
-    }
+    display.printf("RX:%lu TX:%lu", udpjsonPacketsReceived % 100000, dmxFramesSent % 100000);
 
     display.display();
 }
@@ -1473,11 +1399,10 @@ void setup() {
         // Start UDP listeners
         configUdp.begin(CONFIG_PORT);
         discoveryUdp.begin(DISCOVERY_PORT);
-        udpjsonDmxUdp.begin(UDPJSON_DMX_PORT);  // Port 6455 for UDPJSON DMX
+        udpjsonDmxUdp.begin(UDPJSON_DMX_PORT);  // Port 6455 for UDPJSON DMX (SSOT transport)
         Serial.printf("UDP: Config=%d, Discovery=%d, UDPJSON DMX=%d\n", CONFIG_PORT, DISCOVERY_PORT, UDPJSON_DMX_PORT);
 
-        // Initialize sACN (legacy, kept for backward compatibility)
-        initSacn();
+        // NOTE: sACN/E1.31 removed - using UDPJSON only
 
         // Enable OTA
         initOTA();
@@ -1511,59 +1436,9 @@ void loop() {
     unsigned long now = millis();
 
     // ─────────────────────────────────────────────────────────────────
-    // sACN/E1.31 RECEPTION (updates dmxIn buffer, does NOT trigger output)
-    // ─────────────────────────────────────────────────────────────────
-    if (!e131.isEmpty()) {
-        e131_packet_t packet;
-        e131.pull(&packet);
-
-        // The library already filters by universe, so this packet matches sourceUniverse
-        processSacnPacket(&packet);
-
-        // If we were offline, come back online
-        if (isOffline) {
-            stopOfflineMode();
-        }
-
-        // Record frame to loop buffer for offline playback
-        recordFrame();
-    }
-
-    // ─────────────────────────────────────────────────────────────────
-    // OFFLINE PLAYBACK - Switch to offline mode after timeout
-    // ─────────────────────────────────────────────────────────────────
-    // DISABLED:     if (lastSacnReceived > 0 && (now - lastSacnReceived) > SACN_TIMEOUT_MS) {
-    // DISABLED:         // Start offline mode if not already
-    // DISABLED:         if (!isOffline) {
-    // DISABLED:             startOfflineMode();
-    // DISABLED:         }
-    // DISABLED: 
-    // DISABLED:         // Handle offline playback based on mode
-    // DISABLED:         if (offlineMode == OFFLINE_NONE) {
-    // DISABLED:             // Gradual fade to black (simple linear fade)
-    // DISABLED:             static unsigned long lastFadeStep = 0;
-    // DISABLED:             if (now - lastFadeStep > 50) {
-    // DISABLED:                 bool anyActive = false;
-    // DISABLED:                 for (int i = 1; i <= 512; i++) {
-    // DISABLED:                     if (dmxIn[i] > 0) {
-    // DISABLED:                         dmxIn[i] = (dmxIn[i] > 5) ? dmxIn[i] - 5 : 0;
-    // DISABLED:                         anyActive = true;
-    // DISABLED:                     }
-    // DISABLED:                 }
-    // DISABLED:                 lastFadeStep = now;
-    // DISABLED:                 if (!anyActive) {
-    // DISABLED:                     lastSacnReceived = 0;
-    // DISABLED:                     Serial.println("sACN: Fade to black complete");
-    // DISABLED:                 }
-    // DISABLED:             }
-    // DISABLED:         } else {
-    // DISABLED:             // Loop or Chase playback
-    // DISABLED:             playOfflineFrame();
-    // DISABLED:         }
-    // DISABLED:     }
-
-    // ─────────────────────────────────────────────────────────────────
-    // UDPJSON DMX COMMANDS (Port 6455) - Primary DMX transport
+    // UDPJSON DMX COMMANDS (Port 6455) - ONLY DMX transport
+    // Updates dmxIn buffer. DMX output runs independently below.
+    // No timeout/watchdog affects output - silence = "nothing changed"
     // ─────────────────────────────────────────────────────────────────
     int udpjsonPacketSize = udpjsonDmxUdp.parsePacket();
     if (udpjsonPacketSize > 0) {
